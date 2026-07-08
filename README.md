@@ -13,9 +13,9 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Menu-bar resident**, no Dock icon (`LSUIElement`)
 - **Always-on-top editor**: floats above every app, visible across Spaces / full-screen; draggable, resizable, remembers its frame
 - **Double-tap Control to summon**: inserts the frontmost app's selection (Accessibility API first, falls back to a synthesized ⌘C)
-- **Drag files in** to insert their paths (paths with spaces are auto-quoted)
+- **Drag files in** to insert their paths
 - **Double-tap Option** to insert the current Finder selection's paths
-- **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted
+- **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
 - **One-key send**: ⌘↵ → if several terminal windows exist, pick one by title → text is pasted into Claude and submitted; the editor clears
 - **History** of sent messages in the menu; click to reload into the editor
 - **Customizable**: summon / Finder modifiers, history size, menu label width (menu → Settings…)

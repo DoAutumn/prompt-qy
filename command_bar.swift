@@ -105,12 +105,9 @@ enum HistoryStore {
 /// Wraps paths that contain shell-significant characters in quotes so they
 /// paste cleanly into a terminal prompt.
 enum PathFormat {
-    static func forInsertion(_ path: String) -> String {
-        let needsQuote = path.contains(where: { " ()&'".contains($0) })
-        guard needsQuote else { return path }
-        let escaped = path.replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"\(escaped)\""
-    }
+    /// Insert paths verbatim (no shell quoting). The target is Claude Code's
+    /// prompt, which resolves paths with spaces fine — quotes would just be noise.
+    static func forInsertion(_ path: String) -> String { path }
 }
 
 extension String {
@@ -392,6 +389,33 @@ final class ScreenshotWatcher {
     private func mtime(_ url: URL) -> Date {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]
             as? Date) ?? .distantPast
+    }
+}
+
+// MARK: - Screenshot thumbnail preference
+
+/// Toggles macOS's screenshot floating thumbnail. While the thumbnail is shown
+/// (the default), the capture is held in memory for ~5s and only written to disk
+/// after it dismisses — so our watcher can't insert the path until then.
+/// Turning it off makes captures save (and insert) immediately.
+enum ScreenshotThumbnail {
+    private static let domain = "com.apple.screencapture"
+    private static let key = "show-thumbnail"
+
+    /// True when the thumbnail is disabled (i.e. captures save immediately).
+    static var isDisabled: Bool {
+        guard let v = UserDefaults(suiteName: domain)?.object(forKey: key) as? Bool
+        else { return false }  // unset ⇒ thumbnail shown ⇒ not disabled
+        return v == false
+    }
+
+    static func setDisabled(_ disabled: Bool) {
+        UserDefaults(suiteName: domain)?.set(!disabled, forKey: key)
+        // Restart SystemUIServer so the screenshot service picks up the change.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        p.arguments = ["SystemUIServer"]
+        try? p.run()
     }
 }
 
@@ -872,6 +896,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             clear.target = self
         }
         menu.addItem(.separator())
+        let shot = menu.addItem(
+            withTitle: "截图后立即插入（关闭悬浮缩略图）",
+            action: #selector(toggleScreenshotThumbnail), keyEquivalent: "")
+        shot.target = self
+        shot.state = ScreenshotThumbnail.isDisabled ? .on : .off
+        menu.addItem(.separator())
         let settings = menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: "")
         settings.target = self
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
@@ -889,6 +919,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func clearHistory() { HistoryStore.clear() }
 
     @objc private func openSettings() { settingsController.show() }
+
+    /// Toggle macOS's screenshot floating thumbnail so captures save — and get
+    /// inserted — immediately instead of after the ~5s preview.
+    @objc private func toggleScreenshotThumbnail() {
+        ScreenshotThumbnail.setDisabled(!ScreenshotThumbnail.isDisabled)
+    }
 
     /// Double-tap Control always shows/focuses the editor (never hides it —
     /// Escape is the only hide gesture) and inserts the frontmost selection if
