@@ -36,7 +36,16 @@
 
 ## 安装
 
-### 方式 A — 一行命令安装（推荐）
+### 方式 A — Homebrew（推荐）
+
+```bash
+brew install --cask DoAutumn/tap/claude-command-bar
+```
+
+更新：`brew upgrade --cask claude-command-bar`。
+卸载并清理配置：`brew uninstall --zap --cask claude-command-bar`。
+
+### 方式 B — 一行命令安装
 
 ```bash
 curl -L -o /tmp/claude-command-bar.zip \
@@ -51,7 +60,7 @@ curl -L -o /tmp/claude-command-bar.zip \
 
 手动方式（不想跑脚本）：到 [Releases](https://github.com/DoAutumn/claude-command-bar/releases/latest) 下 `Claude-Command-Bar.app.zip`，解压拖进 `/Applications`，然后**右键 → 打开 → 在弹窗里再点一次「打开」**（仅一次）即可过 Gatekeeper。
 
-### 方式 B — 从源码构建
+### 方式 C — 从源码构建
 
 依赖 Xcode 命令行工具（`swiftc`），无需 Xcode 工程。
 
@@ -88,6 +97,7 @@ tccutil reset AppleEvents io.github.claude-command-bar
 | `command_bar.swift` | 全部逻辑（单文件） |
 | `build_app.sh` | 编译 + 打包 + 签名成 `.app` |
 | `make_zip.sh` | 把构建好的 App 压成 Release 产物 |
+| `release.sh` | 升 `VERSION`、发 Release、同步更新 Homebrew cask |
 | `generate_icon.swift` | 生成 App 图标 |
 | `setup_signing.sh` | 可选的开发者辅助脚本（见下） |
 

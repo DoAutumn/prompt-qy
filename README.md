@@ -36,7 +36,16 @@ Every inserted path / selection is followed by a newline, so items stack on thei
 
 ## Install
 
-### Option A — one-line install (recommended)
+### Option A — Homebrew (recommended)
+
+```bash
+brew install --cask DoAutumn/tap/claude-command-bar
+```
+
+To update: `brew upgrade --cask claude-command-bar`.
+To remove it and its preferences: `brew uninstall --zap --cask claude-command-bar`.
+
+### Option B — one-line install
 
 ```bash
 curl -L -o /tmp/claude-command-bar.zip \
@@ -51,7 +60,7 @@ What it does: pull the latest release → unzip into `/Applications/` → strip 
 
 Manual (if you'd rather not run a script): grab `Claude-Command-Bar.app.zip` from [Releases](https://github.com/DoAutumn/claude-command-bar/releases/latest), unzip and drag it to `/Applications`, then **right-click → Open → click Open again in the dialog** (only once) to get past Gatekeeper.
 
-### Option B — build from source
+### Option C — build from source
 
 Requires the Xcode Command Line Tools (`swiftc`); no Xcode project needed.
 
@@ -88,6 +97,7 @@ tccutil reset AppleEvents io.github.claude-command-bar
 | `command_bar.swift` | All logic (single file) |
 | `build_app.sh` | Compile + bundle + sign into `.app` |
 | `make_zip.sh` | Zip the built app into a Releases artifact |
+| `release.sh` | Bump `VERSION`, publish a release, update the Homebrew cask |
 | `generate_icon.swift` | Draws the app icon |
 | `setup_signing.sh` | Optional dev helper (see below) |
 

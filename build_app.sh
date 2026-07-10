@@ -8,6 +8,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Claude Command Bar"
 APP="$ROOT/dist/$APP_NAME.app"
 ICONSET="$ROOT/dist/icon.iconset"
+# Single source of truth for the version; release.sh bumps it and keeps the git
+# tag, the GitHub release and the Homebrew cask in sync with it.
+VERSION="$(cat "$ROOT/VERSION")"
 
 echo "==> Cleaning $APP"
 rm -rf "$APP" "$ICONSET"
@@ -26,8 +29,8 @@ DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"
 swiftc -O -target "$(uname -m)-apple-macos${DEPLOYMENT_TARGET}" \
     -o "$APP/Contents/MacOS/claude-command-bar" "$ROOT/command_bar.swift"
 
-echo "==> Writing Info.plist"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+echo "==> Writing Info.plist (version $VERSION)"
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -36,8 +39,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>     <string>Claude Command Bar</string>
     <key>CFBundleIdentifier</key>      <string>io.github.claude-command-bar</string>
     <key>CFBundleExecutable</key>      <string>claude-command-bar</string>
-    <key>CFBundleVersion</key>         <string>1</string>
-    <key>CFBundleShortVersionString</key> <string>0.1.0</string>
+    <key>CFBundleVersion</key>         <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
     <key>CFBundleIconName</key>        <string>AppIcon</string>
