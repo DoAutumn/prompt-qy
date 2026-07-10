@@ -4,22 +4,33 @@
 #
 #   ./release.sh 0.1.2
 #
-# Needs `gh` (authenticated) and a local checkout of DoAutumn/homebrew-tap,
-# expected next to this repo — override with TAP_DIR=/path/to/homebrew-tap.
+# Needs `gh`, authenticated. The Homebrew tap is cloned on demand, so no local
+# checkout of it has to exist — point TAP_DIR at one to reuse it instead.
 set -euo pipefail
+
+TAP_REPO="DoAutumn/homebrew-tap"
 
 VERSION="${1:-}"
 [ -n "$VERSION" ] || { echo "usage: ./release.sh <version>   e.g. ./release.sh 0.1.2"; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-TAP="${TAP_DIR:-$ROOT/../homebrew-tap}"
-CASK="$TAP/Casks/claude-command-bar.rb"
 ZIP="$ROOT/dist/Claude-Command-Bar.app.zip"
 TAG="v$VERSION"
 
-[ -f "$CASK" ] || { echo "!! cask not found: $CASK (set TAP_DIR)"; exit 1; }
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || { echo "!! working tree is dirty — commit first"; exit 1; }
 git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1 && { echo "!! tag $TAG already exists"; exit 1; }
+
+if [ -n "${TAP_DIR:-}" ]; then
+    TAP="$TAP_DIR"
+    git -C "$TAP" pull -q --ff-only
+else
+    TAP="$(mktemp -d)/homebrew-tap"
+    trap 'rm -rf "$(dirname "$TAP")"' EXIT
+    echo "==> Cloning $TAP_REPO"
+    git clone -q "https://github.com/$TAP_REPO.git" "$TAP"
+fi
+CASK="$TAP/Casks/claude-command-bar.rb"
+[ -f "$CASK" ] || { echo "!! cask not found: $CASK"; exit 1; }
 
 echo "$VERSION" > "$ROOT/VERSION"
 
