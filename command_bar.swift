@@ -717,6 +717,9 @@ final class EditorPanel: NSPanel {
         }
         HistoryStore.add(text)
         textView.string = ""
+        // Sending is the end of the interaction — the panel has nothing left to
+        // show, and Terminal is now frontmost anyway. Failures keep it open.
+        orderOut(nil)
     }
 
     /// Boxed payload for the tab-picker menu items.
