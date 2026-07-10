@@ -144,6 +144,14 @@ enum AppleScriptRunner {
         }
         return out.stringValue
     }
+
+    /// Run a script executed for its side effects. `run` returns nil both for a
+    /// failure *and* for a script with no result, so success must be read off
+    /// `lastError` rather than the return value.
+    static func succeeds(_ source: String) -> Bool {
+        _ = run(source)
+        return lastError == nil
+    }
 }
 
 // MARK: - Selection reader
@@ -290,11 +298,15 @@ enum TerminalSender {
     }
 
     /// Put the text on the clipboard, focus the target tab, then paste + Return.
-    static func send(_ text: String, to target: Target) {
+    /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
+    /// so the caller can keep the text instead of silently dropping it.
+    static func send(_ text: String, to target: Target) -> Bool {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
 
+        // Terminal needs a beat to actually come frontmost; paste too early and
+        // the synthesized Cmd+V lands in whatever app is still in front.
         let script = """
         tell application "Terminal"
             set targetWin to window id \(target.windowId)
@@ -302,14 +314,14 @@ enum TerminalSender {
             set frontmost of targetWin to true
             activate
         end tell
-        delay 0.15
+        delay 0.3
         tell application "System Events"
             keystroke "v" using command down
             delay 0.05
             key code 36
         end tell
         """
-        AppleScriptRunner.run(script)
+        return AppleScriptRunner.succeeds(script)
     }
 }
 
@@ -528,6 +540,12 @@ final class EditorPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
 
+    /// Escape must hide the panel even when the text view isn't first responder
+    /// (e.g. focus landed on the title bar, the Send button, or was dropped when
+    /// a popup menu closed). EditorTextView handles the common case; this is the
+    /// responder-chain backstop.
+    override func cancelOperation(_ sender: Any?) { orderOut(nil) }
+
     private func buildContent() {
         let container = NSView()
 
@@ -598,6 +616,15 @@ final class EditorPanel: NSPanel {
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         makeFirstResponder(textView)
+        // NSApp.activate is asynchronous: if the panel wasn't key yet, AppKit
+        // resets the first responder once it becomes key, silently undoing the
+        // line above. Re-assert after activation has settled.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isVisible else { return }
+            if self.firstResponder !== self.textView {
+                self.makeFirstResponder(self.textView)
+            }
+        }
     }
 
     func toggle() {
@@ -642,7 +669,15 @@ final class EditorPanel: NSPanel {
             deliver(text, to: targets[0])
             return
         }
-        // Multiple tabs: let the user pick.
+        // Multiple tabs: let the user pick. NSMenu.popUp spins a nested modal
+        // tracking loop, so it must not run inside the event that triggered it —
+        // from performKeyEquivalent (Cmd+Return, Command still held) or a button
+        // action, the trailing key-up/mouse-up tears the menu straight back down
+        // and nothing is delivered. Defer to the next runloop turn.
+        DispatchQueue.main.async { [weak self] in self?.presentPicker(text, targets) }
+    }
+
+    private func presentPicker(_ text: String, _ targets: [TerminalSender.Target]) {
         let menu = NSMenu()
         for target in targets {
             let item = NSMenuItem(
@@ -651,14 +686,15 @@ final class EditorPanel: NSPanel {
             item.representedObject = Delivery(text: text, target: target)
             menu.addItem(item)
         }
-        // Pop up centered over the editor (Cmd+Return is the common trigger),
-        // rather than tucked by the Send button.
-        if let content = contentView {
-            let center = NSPoint(x: content.bounds.midX - 100, y: content.bounds.midY + 60)
-            menu.popUp(positioning: menu.items.first, at: center, in: content)
-        } else {
+        guard let content = contentView else {
             menu.popUp(positioning: nil, at: .zero, in: sendButton)
+            return
         }
+        // Pop up centered over the editor rather than tucked by the Send button.
+        // `positioning: nil` — pre-highlighting the first item lets a stray
+        // Return key-up select or dismiss it.
+        let center = NSPoint(x: content.bounds.midX - 100, y: content.bounds.midY + 60)
+        menu.popUp(positioning: nil, at: center, in: content)
     }
 
     @objc private func pickTarget(_ sender: NSMenuItem) {
@@ -667,7 +703,18 @@ final class EditorPanel: NSPanel {
     }
 
     private func deliver(_ text: String, to target: TerminalSender.Target) {
-        TerminalSender.send(text, to: target)
+        guard TerminalSender.send(text, to: target) else {
+            // Keep the text — losing a composed prompt to a silent failure is
+            // far worse than an extra dialog.
+            let alert = NSAlert()
+            alert.messageText = "发送失败"
+            alert.informativeText =
+                (AppleScriptRunner.lastError ?? "未知错误")
+                + "\n\n编辑器内容已保留。若是权限问题，请到「系统设置 → 隐私与安全性 → 自动化」，"
+                + "允许「Claude Command Bar」控制 Terminal 与 System Events。"
+            alert.runModal()
+            return
+        }
         HistoryStore.add(text)
         textView.string = ""
     }
