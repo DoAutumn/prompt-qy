@@ -297,6 +297,20 @@ enum TerminalSender {
         }
     }
 
+    /// Send is usually triggered by ⌘↵, so the user is often still physically
+    /// holding ⌘ (and maybe ⇧/⌥) when we synthesize the paste. A lingering ⌘
+    /// turns our Return into ⌘↵ — which Claude Code won't submit — and can
+    /// corrupt the ⌘V too. Wait (briefly) for every modifier to come back up
+    /// before handing off to Terminal.
+    private static func waitForModifiersReleased(timeout: TimeInterval = 0.7) {
+        let watched: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if NSEvent.modifierFlags.intersection(watched).isEmpty { return }
+            usleep(10_000)
+        }
+    }
+
     /// Put the text on the clipboard, focus the target tab, then paste + Return.
     /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
     /// so the caller can keep the text instead of silently dropping it.
@@ -305,8 +319,14 @@ enum TerminalSender {
         pb.clearContents()
         pb.setString(text, forType: .string)
 
-        // Terminal needs a beat to actually come frontmost; paste too early and
-        // the synthesized Cmd+V lands in whatever app is still in front.
+        waitForModifiersReleased()
+
+        // `activate` is asynchronous. A blind `delay` races it: if Terminal
+        // isn't frontmost yet, the synthesized ⌘V + Return land in whatever app
+        // still is (often our own floating editor) — pasting nowhere useful and
+        // never submitting. Poll until Terminal genuinely owns the front, then
+        // paste; report failure if it never gets there so the caller keeps the
+        // text instead of quietly dropping it.
         let script = """
         tell application "Terminal"
             set targetWin to window id \(target.windowId)
@@ -314,14 +334,30 @@ enum TerminalSender {
             set frontmost of targetWin to true
             activate
         end tell
-        delay 0.3
         tell application "System Events"
+            set gotFront to false
+            repeat 100 times
+                if frontmost of process "Terminal" then
+                    set gotFront to true
+                    exit repeat
+                end if
+                delay 0.02
+            end repeat
+            if not gotFront then return "notfront"
+            delay 0.06
             keystroke "v" using command down
             delay 0.05
             key code 36
         end tell
+        return "ok"
         """
-        return AppleScriptRunner.succeeds(script)
+        guard let result = AppleScriptRunner.run(script) else { return false }
+        if result != "ok" {
+            AppleScriptRunner.lastError =
+                "终端窗口未能切到前台，内容已保留，请重试。"
+            return false
+        }
+        return true
     }
 }
 
