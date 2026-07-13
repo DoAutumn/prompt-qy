@@ -772,6 +772,11 @@ final class EditorPanel: NSPanel {
 // MARK: - Settings window
 
 final class SettingsWindowController: NSObject {
+    /// Every popup gets this width so the rows line up and stay put.
+    private static let controlWidth: CGFloat = 140
+    private static let windowWidth: CGFloat = 400
+    private static let margin: CGFloat = 20
+
     private var window: NSWindow?
     private let onChange: () -> Void
     private let summonPopup = NSPopUpButton()
@@ -784,9 +789,10 @@ final class SettingsWindowController: NSObject {
     }
 
     func show() {
-        if window == nil { build() }
+        let isFirstShow = window == nil
+        if isFirstShow { build() }
         syncFromSettings()
-        window?.center()
+        if isFirstShow { window?.center() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -798,9 +804,14 @@ final class SettingsWindowController: NSObject {
         }
         for n in [10, 20, 50, 100, 200] { historyPopup.addItem(withTitle: "\(n)") }
         for w in [20, 30, 40, 60, 80] { widthPopup.addItem(withTitle: "\(w)") }
-        for popup in [summonPopup, finderPopup, historyPopup, widthPopup] {
+        let popups = [summonPopup, finderPopup, historyPopup, widthPopup]
+        for popup in popups {
             popup.target = self
             popup.action = #selector(changed)
+            // Without a fixed width every popup sizes to its own title, so the
+            // column jumps around as the selection changes ("Control (^)" is
+            // narrower than "Option (⌥)").
+            popup.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
         }
 
         func row(_ label: String, _ control: NSView) -> [NSView] {
@@ -816,22 +827,38 @@ final class SettingsWindowController: NSObject {
         ])
         grid.rowSpacing = 12
         grid.columnSpacing = 10
+        // Baseline alignment (the default) leaves the label sitting visibly high
+        // against a bezelled popup; centre each row instead.
+        grid.rowAlignment = .none
+        for i in 0..<grid.numberOfRows { grid.row(at: i).yPlacement = .center }
         grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).xPlacement = .leading
 
+        let textWidth = Self.windowWidth - Self.margin * 2
         let note = NSTextField(wrappingLabelWithString:
             "两个双击手势请用不同的修饰键，否则会冲突。改动即时生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
+        note.alignment = .center
+        note.preferredMaxLayoutWidth = textWidth
+        note.widthAnchor.constraint(equalToConstant: textWidth).isActive = true
 
-        let stack = NSStackView(views: [grid, note])
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let versionLabel = NSTextField(labelWithString: "版本 \(version)")
+        versionLabel.font = .systemFont(ofSize: 11)
+        versionLabel.textColor = .tertiaryLabelColor
+
+        let stack = NSStackView(views: [grid, note, versionLabel])
         stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.alignment = .centerX
         stack.spacing = 16
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.setCustomSpacing(28, after: note)
+        stack.edgeInsets = NSEdgeInsets(
+            top: Self.margin, left: Self.margin, bottom: Self.margin, right: Self.margin)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 240),
+            contentRect: NSRect(x: 0, y: 0, width: Self.windowWidth, height: 240),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "设置"
         w.isReleasedWhenClosed = false
@@ -844,6 +871,12 @@ final class SettingsWindowController: NSObject {
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
         w.contentView = content
+        content.layoutSubtreeIfNeeded()
+        // Height follows the content: a hard-coded one left slack that the stack
+        // distributed between the rows, so the spacing drifted. The width stays
+        // fixed — deriving it from `fittingSize` lets the label column compress
+        // and the grid overflow the right margin.
+        w.setContentSize(NSSize(width: Self.windowWidth, height: content.fittingSize.height))
         window = w
     }
 
