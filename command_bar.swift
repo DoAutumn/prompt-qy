@@ -772,7 +772,11 @@ final class EditorPanel: NSPanel {
 // MARK: - Settings window
 
 final class SettingsWindowController: NSObject {
-    /// Every popup gets this width so the rows line up and stay put.
+    /// Both grid columns are pinned so the rows line up and the block keeps its
+    /// own width. Left to size themselves, the label column hugs weakly, the grid
+    /// stretches to the full content width and the extra space lands inside the
+    /// (trailing-aligned) label column — which shoves the whole block right.
+    private static let labelWidth: CGFloat = 150
     private static let controlWidth: CGFloat = 140
     private static let windowWidth: CGFloat = 400
     private static let margin: CGFloat = 20
@@ -832,7 +836,10 @@ final class SettingsWindowController: NSObject {
         grid.rowAlignment = .none
         for i in 0..<grid.numberOfRows { grid.row(at: i).yPlacement = .center }
         grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 0).width = Self.labelWidth
         grid.column(at: 1).xPlacement = .leading
+        grid.column(at: 1).width = Self.controlWidth
+        grid.setContentHuggingPriority(.required, for: .horizontal)
 
         let textWidth = Self.windowWidth - Self.margin * 2
         let note = NSTextField(wrappingLabelWithString:

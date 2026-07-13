@@ -20,6 +20,12 @@ TAG="v$VERSION"
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || { echo "!! working tree is dirty — commit first"; exit 1; }
 git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1 && { echo "!! tag $TAG already exists"; exit 1; }
 
+# `gh` is not needed until after the tag is pushed, so check it up front: finding
+# out late leaves the tag published with no release behind it, and the rerun then
+# trips over "tag already exists".
+command -v gh >/dev/null || { echo "!! gh not found — install it first (brew install gh)"; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "!! gh is not authenticated — run: gh auth login"; exit 1; }
+
 if [ -n "${TAP_DIR:-}" ]; then
     TAP="$TAP_DIR"
     git -C "$TAP" pull -q --ff-only
@@ -55,7 +61,17 @@ echo "==> Updating cask to $VERSION ($SHA)"
     "$CASK"
 
 git -C "$TAP" commit -am "claude-command-bar $VERSION"
-git -C "$TAP" push
+# The tap is cloned over https, so pushing needs a git credential helper — which
+# `gh auth login` alone does not set up. Say so instead of dying on git's
+# "could not read Username": the release is already out at this point and only
+# the cask bump is missing.
+git -C "$TAP" push || {
+    echo "!! pushing the tap failed — the GitHub release for $TAG is already published,"
+    echo "   only the cask bump is missing. Fix the git credentials and rerun just that:"
+    echo "     gh auth setup-git"
+    echo "     ./release.sh $VERSION   # will refuse: the tag exists — bump the cask by hand instead"
+    exit 1
+}
 
 echo
 echo "==> Released $TAG"
