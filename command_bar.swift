@@ -65,6 +65,10 @@ enum Settings {
         get { ModifierChoice(rawValue: d.string(forKey: "finderModifier") ?? "") ?? .option }
         set { d.set(newValue.rawValue, forKey: "finderModifier") }
     }
+    static var openModifier: ModifierChoice {
+        get { ModifierChoice(rawValue: d.string(forKey: "openModifier") ?? "") ?? .command }
+        set { d.set(newValue.rawValue, forKey: "openModifier") }
+    }
     static var historyLimit: Int {
         get { let v = d.integer(forKey: "historyLimit"); return v > 0 ? v : 50 }
         set { d.set(newValue, forKey: "historyLimit") }
@@ -225,6 +229,40 @@ enum FinderSelection {
         """
         guard let out = AppleScriptRunner.run(script), !out.isEmpty else { return [] }
         return out.split(separator: "\n").map(String.init)
+    }
+}
+
+// MARK: - External editor
+
+/// Opens paths in Sublime Text. Sublime ships a different bundle id per major
+/// version, and installs that predate the App Store build have none of them —
+/// so probe the ids, then the conventional install path, and only give up after
+/// that.
+enum ExternalEditor {
+    static let displayName = "Sublime Text"
+    private static let bundleIDs = ["com.sublimetext.4", "com.sublimetext.3", "com.sublimetext"]
+    private static let fallbackPath = "/Applications/Sublime Text.app"
+
+    static var appURL: URL? {
+        for id in bundleIDs {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+                return url
+            }
+        }
+        return FileManager.default.fileExists(atPath: fallbackPath)
+            ? URL(fileURLWithPath: fallbackPath) : nil
+    }
+
+    /// Returns false when Sublime Text isn't installed (nothing is opened).
+    static func open(_ paths: [String]) -> Bool {
+        guard let app = appURL else { return false }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.open(
+            paths.map { URL(fileURLWithPath: $0) },
+            withApplicationAt: app,
+            configuration: config)
+        return true
     }
 }
 
@@ -478,8 +516,7 @@ final class DoubleTapMonitor {
     private let onDoubleTap: () -> Void
 
     private var lastPress: TimeInterval = 0
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private var monitors: [Any] = []
 
     init(keyCodes: Set<UInt16>,
          flag: NSEvent.ModifierFlags,
@@ -492,19 +529,33 @@ final class DoubleTapMonitor {
     }
 
     func start() {
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) {
-            [weak self] event in self?.handle(event)
+        add(.flagsChanged) { [weak self] event in self?.handle(event) }
+        // A modifier held down for a shortcut produces a press edge too, so ⌘C
+        // then ⌘V (or ⌃C twice in a terminal), and ⌘-clicking two files in
+        // Finder, both look exactly like a deliberate double-tap. A key or click
+        // in between proves the taps weren't standalone — break the streak.
+        // Without this, Command is unusable as a gesture: ⌘-click is how you
+        // multi-select the very files this gesture is meant to open.
+        add([.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]) {
+            [weak self] _ in self?.lastPress = 0
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) {
-            [weak self] event in self?.handle(event); return event
+    }
+
+    private func add(_ mask: NSEvent.EventTypeMask, _ handle: @escaping (NSEvent) -> Void) {
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handle) {
+            monitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: {
+            handle($0)
+            return $0
+        }) {
+            monitors.append(l)
         }
     }
 
     func stop() {
-        if let g = globalMonitor { NSEvent.removeMonitor(g) }
-        if let l = localMonitor { NSEvent.removeMonitor(l) }
-        globalMonitor = nil
-        localMonitor = nil
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
     }
 
     private func handle(_ event: NSEvent) {
@@ -593,6 +644,9 @@ final class EditorPanel: NSPanel {
 
         textView.autoresizingMask = [.width]
         textView.isRichText = false
+        // Off by default on a bare NSTextView: without it nothing is registered
+        // with the undo manager and the Edit menu's ⌘Z is a no-op.
+        textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -776,7 +830,7 @@ final class SettingsWindowController: NSObject {
     /// own width. Left to size themselves, the label column hugs weakly, the grid
     /// stretches to the full content width and the extra space lands inside the
     /// (trailing-aligned) label column — which shoves the whole block right.
-    private static let labelWidth: CGFloat = 150
+    private static let labelWidth: CGFloat = 190
     private static let controlWidth: CGFloat = 140
     private static let windowWidth: CGFloat = 400
     private static let margin: CGFloat = 20
@@ -785,6 +839,7 @@ final class SettingsWindowController: NSObject {
     private let onChange: () -> Void
     private let summonPopup = NSPopUpButton()
     private let finderPopup = NSPopUpButton()
+    private let openPopup = NSPopUpButton()
     private let historyPopup = NSPopUpButton()
     private let widthPopup = NSPopUpButton()
 
@@ -805,10 +860,11 @@ final class SettingsWindowController: NSObject {
         for m in ModifierChoice.allCases {
             summonPopup.addItem(withTitle: m.displayName)
             finderPopup.addItem(withTitle: m.displayName)
+            openPopup.addItem(withTitle: m.displayName)
         }
         for n in [10, 20, 50, 100, 200] { historyPopup.addItem(withTitle: "\(n)") }
         for w in [20, 30, 40, 60, 80] { widthPopup.addItem(withTitle: "\(w)") }
-        let popups = [summonPopup, finderPopup, historyPopup, widthPopup]
+        let popups = [summonPopup, finderPopup, openPopup, historyPopup, widthPopup]
         for popup in popups {
             popup.target = self
             popup.action = #selector(changed)
@@ -826,6 +882,7 @@ final class SettingsWindowController: NSObject {
         let grid = NSGridView(views: [
             row("双击呼出编辑器：", summonPopup),
             row("双击插入 Finder 选中项：", finderPopup),
+            row("双击用 \(ExternalEditor.displayName) 打开：", openPopup),
             row("历史保留条数：", historyPopup),
             row("菜单标题最大字数：", widthPopup),
         ])
@@ -843,7 +900,7 @@ final class SettingsWindowController: NSObject {
 
         let textWidth = Self.windowWidth - Self.margin * 2
         let note = NSTextField(wrappingLabelWithString:
-            "两个双击手势请用不同的修饰键，否则会冲突。改动即时生效。")
+            "三个双击手势请用不同的修饰键，否则会冲突。改动即时生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
         note.alignment = .center
@@ -890,6 +947,7 @@ final class SettingsWindowController: NSObject {
     private func syncFromSettings() {
         summonPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.summonModifier) ?? 0)
         finderPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.finderModifier) ?? 0)
+        openPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.openModifier) ?? 0)
         historyPopup.selectItem(withTitle: "\(Settings.historyLimit)")
         widthPopup.selectItem(withTitle: "\(Settings.labelWidth)")
     }
@@ -897,6 +955,7 @@ final class SettingsWindowController: NSObject {
     @objc private func changed() {
         Settings.summonModifier = ModifierChoice.allCases[summonPopup.indexOfSelectedItem]
         Settings.finderModifier = ModifierChoice.allCases[finderPopup.indexOfSelectedItem]
+        Settings.openModifier = ModifierChoice.allCases[openPopup.indexOfSelectedItem]
         if let n = Int(historyPopup.titleOfSelectedItem ?? "") { Settings.historyLimit = n }
         if let w = Int(widthPopup.titleOfSelectedItem ?? "") { Settings.labelWidth = w }
         onChange()
@@ -910,6 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let panel = EditorPanel()
     private var summonMonitor: DoubleTapMonitor?
     private var finderMonitor: DoubleTapMonitor?
+    private var openMonitor: DoubleTapMonitor?
     private var screenshotWatcher: ScreenshotWatcher!
     private lazy var settingsController = SettingsWindowController { [weak self] in
         self?.restartMonitors()
@@ -935,6 +995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func restartMonitors() {
         summonMonitor?.stop()
         finderMonitor?.stop()
+        openMonitor?.stop()
         let summon = Settings.summonModifier
         summonMonitor = DoubleTapMonitor(
             keyCodes: summon.keyCodes, flag: summon.flag,
@@ -945,6 +1006,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyCodes: finder.keyCodes, flag: finder.flag,
             interval: Settings.doubleTapInterval) { [weak self] in self?.onFinderPaste() }
         finderMonitor?.start()
+        let open = Settings.openModifier
+        openMonitor = DoubleTapMonitor(
+            keyCodes: open.keyCodes, flag: open.flag,
+            interval: Settings.doubleTapInterval) { [weak self] in self?.onOpenInEditor() }
+        openMonitor?.start()
     }
 
     /// An accessory (LSUIElement) app has no menu bar, but a main menu is still
@@ -1071,6 +1137,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let joined = paths.map { PathFormat.forInsertion($0) }.joined(separator: "\n")
         panel.showAndFocus()
         panel.insertAtCursor(joined + "\n")
+    }
+
+    /// Double-tap Command: open the current Finder selection in Sublime Text.
+    /// Deliberately does not touch the editor panel — this gesture is about the
+    /// file, not about composing a prompt.
+    private func onOpenInEditor() {
+        let paths = FinderSelection.paths()
+        guard !paths.isEmpty else { NSSound.beep(); return }
+        guard ExternalEditor.open(paths) else {
+            let alert = NSAlert()
+            alert.messageText = "未找到 \(ExternalEditor.displayName)"
+            alert.informativeText =
+                "双击「打开文件」手势用 \(ExternalEditor.displayName) 打开 Finder 中选中的文件，"
+                + "请先安装它（或把它放到 /Applications）。"
+            alert.runModal()
+            return
+        }
     }
 
     private func ensureAccessibilityPermission() {

@@ -15,10 +15,11 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Double-tap Control to summon**: inserts the frontmost app's selection (Accessibility API first, falls back to a synthesized ⌘C)
 - **Drag files in** to insert their paths
 - **Double-tap Option** to insert the current Finder selection's paths
+- **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
 - **One-key send**: ⌘↵ → if several terminal windows exist, pick one by title → text is pasted into Claude and submitted; the editor clears
 - **History** of sent messages in the menu; click to reload into the editor
-- **Customizable**: summon / Finder modifiers, history size, menu label width (menu → Settings…)
+- **Customizable**: the three double-tap modifiers, history size, menu label width (menu → Settings…)
 
 ## Gestures
 
@@ -26,6 +27,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 |---|---|
 | Double-tap **Control** | Summon the editor; insert the selection if any |
 | Double-tap **Option** | Insert the current Finder selection's paths |
+| Double-tap **Command** | Open the current Finder selection in Sublime Text |
 | Drag a file into the editor | Insert its path |
 | ⌘⇧4 screenshot | Insert the new screenshot's path |
 | **⌘↵** | Send to the terminal (pick a window if several) |
