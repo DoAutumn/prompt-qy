@@ -20,6 +20,25 @@ TAG="v$VERSION"
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || { echo "!! working tree is dirty — commit first"; exit 1; }
 git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1 && { echo "!! tag $TAG already exists"; exit 1; }
 
+# A clean tree says nothing about being up to date: a release cut from another
+# machine leaves this one behind, and the push then bounces *after* the release
+# commit and tag are already made locally. Check against the remote up front —
+# and check the remote tag too, since the local one can be absent while the
+# version is long since published.
+echo "==> Checking the remote"
+git -C "$ROOT" fetch -q origin
+[ -z "$(git -C "$ROOT" ls-remote --tags origin "$TAG")" ] || {
+    echo "!! tag $TAG already exists on the remote — someone released it elsewhere."
+    echo "   Pull, then pick the next free version."
+    exit 1
+}
+UPSTREAM="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo origin/main)"
+BEHIND="$(git -C "$ROOT" rev-list --count "HEAD..$UPSTREAM")"
+[ "$BEHIND" -eq 0 ] || {
+    echo "!! HEAD is $BEHIND commit(s) behind $UPSTREAM — rebase first, then rerun."
+    exit 1
+}
+
 # `gh` is not needed until after the tag is pushed, so check it up front: finding
 # out late leaves the tag published with no release behind it, and the rerun then
 # trips over "tag already exists".
