@@ -6,7 +6,8 @@
 //   1. Menu-bar item + always-on-top draggable/resizable editor + double-tap
 //      Control to summon/dismiss.
 //   2. Grab the frontmost app's selection on summon (AX, then synthesized
-//      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app tab.
+//      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app
+//      or iTerm2 tab.
 //   3. Drag files onto the editor to insert their paths + a double-tap Option
 //      hotkey to insert the Finder selection.
 //   4. Watch the screenshot folder and insert the path of new screenshots.
@@ -76,6 +77,11 @@ enum Settings {
     static var labelWidth: Int {
         get { let v = d.integer(forKey: "labelWidth"); return v > 0 ? v : 40 }
         set { d.set(newValue, forKey: "labelWidth") }
+    }
+    /// Which terminal to send to. `nil` means auto: offer whichever are running.
+    static var terminalApp: TerminalApp? {
+        get { TerminalApp(rawValue: d.string(forKey: "terminalApp") ?? "") }
+        set { d.set(newValue?.rawValue ?? "auto", forKey: "terminalApp") }
     }
 }
 
@@ -266,13 +272,69 @@ enum ExternalEditor {
     }
 }
 
-// MARK: - Terminal.app sender
+// MARK: - Terminal sender
+
+/// The terminals we can drive. Both are scripted the same way — focus a tab,
+/// then paste + Return — and only differ in how their windows are addressed.
+enum TerminalApp: String, CaseIterable {
+    case terminal
+    case iterm
+
+    var bundleId: String {
+        switch self {
+        case .terminal: return "com.apple.Terminal"
+        case .iterm: return "com.googlecode.iterm2"
+        }
+    }
+
+    /// What System Events calls the process. Not interchangeable with the
+    /// AppleScript name: iTerm2's app object answers to "iTerm", its process
+    /// is "iTerm2". Addressing the app by bundle id sidesteps that entirely,
+    /// but `frontmost of process` still needs the process name.
+    var processName: String {
+        switch self {
+        case .terminal: return "Terminal"
+        case .iterm: return "iTerm2"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .terminal: return "终端.app"
+        case .iterm: return "iTerm2"
+        }
+    }
+
+    /// `tell application id …` *launches* the app if it isn't running, so every
+    /// enumeration must be gated on this — otherwise merely pressing Send would
+    /// boot up whichever terminal the user deliberately left closed.
+    var isRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty
+    }
+}
 
 enum TerminalSender {
     struct Target {
+        let app: TerminalApp
         let windowId: String
         let tabIndex: String
+        /// iTerm2 splits a tab into panes and each is a separate destination.
+        /// Empty for Terminal.app, which has no equivalent.
+        let sessionId: String
         let label: String
+    }
+
+    /// One window/tab/pane as the enumeration scripts report it, before the
+    /// labels are worked out (which needs the whole list for context).
+    private struct Row {
+        let app: TerminalApp
+        let windowId: String
+        let windowIndex: Int
+        let tabIndex: Int
+        let paneIndex: Int
+        let sessionId: String
+        let bounds: NSRect?
+        let name: String
     }
 
     /// Cap a menu label to a sensible width; the tail (command + window size)
@@ -281,36 +343,99 @@ enum TerminalSender {
         s.count <= max ? s : String(s.prefix(max)) + "…"
     }
 
-    /// Enumerate every window/tab of Terminal.app, tagging each with the
-    /// processes running in it so the user can tell which one holds Claude.
+    /// Targets across every terminal the user allows, ready for the picker.
+    /// Honours the `terminalApp` setting; in auto mode both are offered.
     static func listTargets() -> [Target] {
-        // NB: inside `tell application "Terminal"`, the bareword `tab` resolves
-        // to Terminal's *tab class*, not the tab-character constant — so build
-        // the field separator explicitly via `character id 9`.
+        let wanted = Settings.terminalApp.map { [$0] } ?? TerminalApp.allCases
+        var rows: [Row] = []
+        var firstError: String?
+        for app in wanted where app.isRunning {
+            rows += enumerate(app)
+            // One terminal failing (usually an un-granted automation prompt)
+            // shouldn't hide the other's tabs — but keep the message around in
+            // case *nothing* turned up and the user needs to know why.
+            if firstError == nil { firstError = AppleScriptRunner.lastError }
+        }
+        AppleScriptRunner.lastError = rows.isEmpty ? firstError : nil
+        return label(rows)
+    }
+
+    private static func enumerate(_ app: TerminalApp) -> [Row] {
+        // NB: inside a `tell application` block the bareword `tab` resolves to
+        // the app's *tab class*, not the tab character — so build the field
+        // separator explicitly via `character id 9`.
+        //
+        // Both scripts emit the same 10 columns, with the free-text name last
+        // so a stray tab in it can't shift the other fields.
+        let body: String
+        switch app {
+        case .terminal:
+            body = """
+                    set winName to ""
+                    try
+                        set winName to name of w
+                    end try
+                    set tabList to tabs of w
+                    set tabCount to count of tabList
+                    repeat with ti from 1 to count of tabList
+                        set t to item ti of tabList
+                        set procText to ""
+                        try
+                            set AppleScript's text item delimiters to " "
+                            set procText to (processes of t) as text
+                            set AppleScript's text item delimiters to ""
+                        end try
+                        -- Terminal has no per-tab title: `custom title` is the
+                        -- literal default ("终端") and `title displays custom
+                        -- title` is true regardless, so both are useless. The
+                        -- window name is what Claude Code sets — but it tracks
+                        -- only the *selected* tab, so it can be trusted to name
+                        -- a tab only when the window holds exactly one. Past
+                        -- that, the running processes are all that is per-tab.
+                        set rowName to ""
+                        if tabCount is 1 then set rowName to winName
+                        if rowName is "" then set rowName to procText
+                        if rowName is "" then set rowName to winName
+                        set end of outLines to wid & fieldSep & (wi as text) & fieldSep & (ti as text) & fieldSep & "1" & fieldSep & "" & fieldSep & geo & fieldSep & rowName
+                    end repeat
+            """
+        case .iterm:
+            body = """
+                    set tabList to tabs of w
+                    repeat with ti from 1 to count of tabList
+                        set sesList to sessions of (item ti of tabList)
+                        repeat with si from 1 to count of sesList
+                            set s to item si of sesList
+                            set rowName to ""
+                            try
+                                set rowName to name of s
+                            end try
+                            set end of outLines to wid & fieldSep & (wi as text) & fieldSep & (ti as text) & fieldSep & (si as text) & fieldSep & (id of s) & fieldSep & geo & fieldSep & rowName
+                        end repeat
+                    end repeat
+            """
+        }
         let script = """
         set fieldSep to (character id 9)
         set rowSep to (character id 10)
-        tell application "Terminal"
+        tell application id "\(app.bundleId)"
             set outLines to {}
             set winList to windows
             repeat with wi from 1 to count of winList
                 set w to item wi of winList
-                set wid to id of w
-                set winName to ""
+                set wid to (id of w) as text
+                -- `bounds` is the only geometry both apps agree on; iTerm2's
+                -- `frame`/`position` raise -10000. Coordinates are global with
+                -- the origin at the top-left of the primary screen.
+                set bl to 0
+                set bt to 0
+                set br to 0
+                set bb to 0
                 try
-                    set winName to name of w
+                    set {bl, bt, br, bb} to bounds of w
                 end try
-                set tabList to tabs of w
-                repeat with ti from 1 to count of tabList
-                    set t to item ti of tabList
-                    set procText to ""
-                    try
-                        set AppleScript's text item delimiters to " "
-                        set procText to (processes of t) as text
-                        set AppleScript's text item delimiters to ""
-                    end try
-                    set end of outLines to (wid as text) & fieldSep & (ti as text) & fieldSep & winName & fieldSep & procText
-                end repeat
+                set geo to (bl as text) & fieldSep & (bt as text) & fieldSep & (br as text) & fieldSep & (bb as text)
+        \(body)
             end repeat
             set AppleScript's text item delimiters to rowSep
             return outLines as text
@@ -318,20 +443,57 @@ enum TerminalSender {
         """
         guard let out = AppleScriptRunner.run(script), !out.isEmpty else { return [] }
         return out.split(separator: "\n").compactMap { line in
-            let parts = line.components(separatedBy: "\t")
-            guard parts.count >= 4 else { return nil }
-            let winName = parts[2].trimmingCharacters(in: .whitespaces)
-            let procs = parts[3].trimmingCharacters(in: .whitespaces)
-            // The window title already carries project/task info; fall back to
-            // the id + processes only when it's empty.
-            let label: String
-            if winName.isEmpty {
-                label = procs.isEmpty ? "窗口 \(parts[0])" : "窗口 \(parts[0])  ·  \(procs)"
-            } else {
-                label = winName
+            let p = line.components(separatedBy: "\t")
+            guard p.count >= 10,
+                  let wi = Int(p[1]), let ti = Int(p[2]), let si = Int(p[3]) else { return nil }
+            var bounds: NSRect?
+            if let l = Double(p[5]), let t = Double(p[6]),
+               let r = Double(p[7]), let b = Double(p[8]), r > l, b > t {
+                bounds = NSRect(x: l, y: t, width: r - l, height: b - t)
             }
-            return Target(windowId: parts[0], tabIndex: parts[1],
-                          label: truncate(label, max: Settings.labelWidth))
+            return Row(app: app, windowId: p[0], windowIndex: wi, tabIndex: ti, paneIndex: si,
+                       sessionId: p[4], bounds: bounds,
+                       name: p[9...].joined(separator: " ").trimmingCharacters(in: .whitespaces))
+        }
+    }
+
+    /// Which display a window sits on, for labelling. Nil on a single-screen
+    /// setup, where naming the screen would be noise.
+    private static func screenName(_ bounds: NSRect?) -> String? {
+        let screens = NSScreen.screens
+        guard screens.count > 1, let bounds = bounds, let primary = screens.first else { return nil }
+        // AppleScript reports top-left-origin coordinates; NSScreen frames are
+        // bottom-left-origin off the primary screen. Flip before hit-testing.
+        let center = NSPoint(x: bounds.midX, y: primary.frame.maxY - bounds.midY)
+        return screens.first { $0.frame.contains(center) }?.localizedName
+    }
+
+    /// Name each target, adding only the qualifiers that are actually needed to
+    /// tell it apart: with one window and one tab, "窗口 1 · 标签 1" is noise.
+    private static func label(_ rows: [Row]) -> [Target] {
+        let windowsPerApp = Dictionary(grouping: rows, by: { $0.app })
+            .mapValues { Set($0.map(\.windowId)).count }
+        let tabsPerWindow = Dictionary(grouping: rows, by: { $0.windowId })
+            .mapValues { Set($0.map(\.tabIndex)).count }
+        let panesPerTab = Dictionary(grouping: rows, by: { "\($0.windowId)/\($0.tabIndex)" })
+            .mapValues { $0.count }
+
+        return rows.map { r in
+            var name = r.name
+            if name.isEmpty { name = "窗口 \(r.windowId)" }
+            var quals: [String] = []
+            if windowsPerApp[r.app, default: 1] > 1 { quals.append("窗口 \(r.windowIndex)") }
+            if tabsPerWindow[r.windowId, default: 1] > 1 { quals.append("标签 \(r.tabIndex)") }
+            if panesPerTab["\(r.windowId)/\(r.tabIndex)", default: 1] > 1 {
+                quals.append("分屏 \(r.paneIndex)")
+            }
+            if let screen = screenName(r.bounds) { quals.append(screen) }
+            // Truncate the free-text name only — the qualifiers are what make
+            // the entry distinguishable, so they must survive.
+            var label = truncate(name, max: Settings.labelWidth)
+            if !quals.isEmpty { label += "  ·  " + quals.joined(separator: " · ") }
+            return Target(app: r.app, windowId: r.windowId, tabIndex: "\(r.tabIndex)",
+                          sessionId: r.sessionId, label: label)
         }
     }
 
@@ -359,23 +521,46 @@ enum TerminalSender {
 
         waitForModifiersReleased()
 
-        // `activate` is asynchronous. A blind `delay` races it: if Terminal
-        // isn't frontmost yet, the synthesized ⌘V + Return land in whatever app
-        // still is (often our own floating editor) — pasting nowhere useful and
-        // never submitting. Poll until Terminal genuinely owns the front, then
-        // paste; report failure if it never gets there so the caller keeps the
-        // text instead of quietly dropping it.
-        let script = """
-        tell application "Terminal"
-            set targetWin to window id \(target.windowId)
+        // Focusing differs: Terminal.app selects a tab and raises the window by
+        // property, iTerm2 has a `select` verb that walks window → tab → pane.
+        // (iTerm2 also has `write text`, which needs no focus at all — but it
+        // replays embedded newlines as Return presses, so a multi-line prompt
+        // would submit itself line by line. Pasting keeps it intact, because
+        // the terminal wraps a real ⌘V in bracketed paste.)
+        let focus: String
+        switch target.app {
+        case .terminal:
+            focus = """
             set selected of tab \(target.tabIndex) of targetWin to true
             set frontmost of targetWin to true
+            """
+        case .iterm:
+            focus = """
+            select targetWin
+            select tab \(target.tabIndex) of targetWin
+            select session id "\(target.sessionId)" of tab \(target.tabIndex) of targetWin
+            """
+        }
+
+        // `activate` is asynchronous. A blind `delay` races it: if the terminal
+        // isn't frontmost yet, the synthesized ⌘V + Return land in whatever app
+        // still is (often our own floating editor) — pasting nowhere useful and
+        // never submitting. Poll until it genuinely owns the front, then paste;
+        // report failure if it never gets there so the caller keeps the text
+        // instead of quietly dropping it.
+        let script = """
+        tell application id "\(target.app.bundleId)"
+            set targetWin to window id \(target.windowId)
+            try
+                set miniaturized of targetWin to false
+            end try
+        \(focus)
             activate
         end tell
         tell application "System Events"
             set gotFront to false
             repeat 100 times
-                if frontmost of process "Terminal" then
+                if frontmost of process "\(target.app.processName)" then
                     set gotFront to true
                     exit repeat
                 end if
@@ -392,7 +577,7 @@ enum TerminalSender {
         guard let result = AppleScriptRunner.run(script) else { return false }
         if result != "ok" {
             AppleScriptRunner.lastError =
-                "终端窗口未能切到前台，内容已保留，请重试。"
+                "\(target.app.displayName) 窗口未能切到前台，内容已保留，请重试。"
             return false
         }
         return true
@@ -741,16 +926,23 @@ final class EditorPanel: NSPanel {
         }
         let targets = TerminalSender.listTargets()
         guard !targets.isEmpty else {
+            // Name what was actually looked at: "no window found" is baffling
+            // when the setting quietly pinned the search to the other terminal.
+            let scope = Settings.terminalApp.map { $0.displayName }
+                ?? TerminalApp.allCases.map { $0.displayName }.joined(separator: " / ")
             let alert = NSAlert()
             if let e = AppleScriptRunner.lastError {
-                alert.messageText = "无法访问 Terminal.app"
+                alert.messageText = "无法访问 \(scope)"
                 alert.informativeText =
                     "AppleScript 错误：\(e)\n\n"
                     + "多半是自动化权限：请到「系统设置 → 隐私与安全性 → 自动化」，"
-                    + "允许「Claude Command Bar」控制 Terminal 与 System Events。"
+                    + "允许「Claude Command Bar」控制终端与 System Events。"
             } else {
-                alert.messageText = "未找到运行中的 Terminal.app 窗口"
-                alert.informativeText = "请先打开一个 Terminal.app 窗口（里面跑着 Claude Code），再发送。"
+                alert.messageText = "未找到运行中的 \(scope) 窗口"
+                alert.informativeText =
+                    "请先打开一个 \(scope) 窗口（里面跑着 Claude Code），再发送。"
+                    + (Settings.terminalApp == nil ? ""
+                       : "\n\n当前设置只发送到 \(scope)，可在设置中改为「自动」。")
             }
             alert.runModal()
             return
@@ -769,7 +961,18 @@ final class EditorPanel: NSPanel {
 
     private func presentPicker(_ text: String, _ targets: [TerminalSender.Target]) {
         let menu = NSMenu()
+        // Only head the list with app names when both terminals are in it —
+        // with one, every row would carry the same redundant banner.
+        let grouped = Set(targets.map(\.app)).count > 1
+        var currentApp: TerminalApp?
         for target in targets {
+            if grouped && target.app != currentApp {
+                if currentApp != nil { menu.addItem(.separator()) }
+                let header = NSMenuItem(title: target.app.displayName, action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                menu.addItem(header)
+                currentApp = target.app
+            }
             let item = NSMenuItem(
                 title: target.label, action: #selector(pickTarget(_:)), keyEquivalent: "")
             item.target = self
@@ -801,14 +1004,14 @@ final class EditorPanel: NSPanel {
             alert.informativeText =
                 (AppleScriptRunner.lastError ?? "未知错误")
                 + "\n\n编辑器内容已保留。若是权限问题，请到「系统设置 → 隐私与安全性 → 自动化」，"
-                + "允许「Claude Command Bar」控制 Terminal 与 System Events。"
+                + "允许「Claude Command Bar」控制 \(target.app.displayName) 与 System Events。"
             alert.runModal()
             return
         }
         HistoryStore.add(text)
         textView.string = ""
         // Sending is the end of the interaction — the panel has nothing left to
-        // show, and Terminal is now frontmost anyway. Failures keep it open.
+        // show, and the terminal is now frontmost anyway. Failures keep it open.
         orderOut(nil)
     }
 
@@ -837,6 +1040,7 @@ final class SettingsWindowController: NSObject {
 
     private var window: NSWindow?
     private let onChange: () -> Void
+    private let terminalPopup = NSPopUpButton()
     private let summonPopup = NSPopUpButton()
     private let finderPopup = NSPopUpButton()
     private let openPopup = NSPopUpButton()
@@ -864,7 +1068,10 @@ final class SettingsWindowController: NSObject {
         }
         for n in [10, 20, 50, 100, 200] { historyPopup.addItem(withTitle: "\(n)") }
         for w in [20, 30, 40, 60, 80] { widthPopup.addItem(withTitle: "\(w)") }
-        let popups = [summonPopup, finderPopup, openPopup, historyPopup, widthPopup]
+        // Index 0 is auto; the rest track `TerminalApp.allCases` positionally.
+        terminalPopup.addItem(withTitle: "自动")
+        for app in TerminalApp.allCases { terminalPopup.addItem(withTitle: app.displayName) }
+        let popups = [terminalPopup, summonPopup, finderPopup, openPopup, historyPopup, widthPopup]
         for popup in popups {
             popup.target = self
             popup.action = #selector(changed)
@@ -880,6 +1087,7 @@ final class SettingsWindowController: NSObject {
             return [l, control]
         }
         let grid = NSGridView(views: [
+            row("目标终端：", terminalPopup),
             row("双击呼出编辑器：", summonPopup),
             row("双击插入 Finder 选中项：", finderPopup),
             row("双击用 \(ExternalEditor.displayName) 打开：", openPopup),
@@ -950,6 +1158,8 @@ final class SettingsWindowController: NSObject {
         openPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.openModifier) ?? 0)
         historyPopup.selectItem(withTitle: "\(Settings.historyLimit)")
         widthPopup.selectItem(withTitle: "\(Settings.labelWidth)")
+        terminalPopup.selectItem(at: Settings.terminalApp
+            .flatMap { TerminalApp.allCases.firstIndex(of: $0) }.map { $0 + 1 } ?? 0)
     }
 
     @objc private func changed() {
@@ -958,6 +1168,8 @@ final class SettingsWindowController: NSObject {
         Settings.openModifier = ModifierChoice.allCases[openPopup.indexOfSelectedItem]
         if let n = Int(historyPopup.titleOfSelectedItem ?? "") { Settings.historyLimit = n }
         if let w = Int(widthPopup.titleOfSelectedItem ?? "") { Settings.labelWidth = w }
+        let i = terminalPopup.indexOfSelectedItem
+        Settings.terminalApp = i > 0 ? TerminalApp.allCases[i - 1] : nil
         onChange()
     }
 }

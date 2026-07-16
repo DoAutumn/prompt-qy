@@ -45,7 +45,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
     <key>CFBundleIconName</key>        <string>AppIcon</string>
     <key>LSUIElement</key>             <true/>
-    <key>NSAppleEventsUsageDescription</key> <string>控制 Finder 与 Terminal.app，以插入文件路径、把内容发送到终端并执行。</string>
+    <key>NSAppleEventsUsageDescription</key> <string>控制 Finder 与终端（终端.app / iTerm2），以插入文件路径、把内容发送到终端并执行。</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSHumanReadableCopyright</key> <string>Personal tool. Not an Anthropic product.</string>
