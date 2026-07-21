@@ -1,4 +1,4 @@
-// Programmatically draw the Claude Command Bar app icon at every iconset size.
+// Programmatically draw the PromptQy app icon at every iconset size.
 // Theme: a text-input field with a chevron prompt and a caret — evoking the
 // composer that feeds a terminal. Used by build_app.sh:
 //   swift generate_icon.swift <output.iconset>

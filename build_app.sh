@@ -1,11 +1,11 @@
 #!/bin/bash
-# Build "Claude Command Bar.app" — an LSUIElement (no Dock) menu-bar app that
+# Build "PromptQy.app" — an LSUIElement (no Dock) menu-bar app that
 # hosts the always-on-top composer. Mirrors the build form of the sibling
 # claude-desktop-usage project.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP_NAME="Claude Command Bar"
+APP_NAME="PromptQy"
 APP="$ROOT/dist/$APP_NAME.app"
 ICONSET="$ROOT/dist/icon.iconset"
 # Single source of truth for the version; release.sh bumps it and keeps the git
@@ -27,7 +27,7 @@ echo "==> Compiling Swift binary"
 # Pin the deployment target so the Mach-O runs on older macOS (see sibling repo).
 DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"
 swiftc -O -target "$(uname -m)-apple-macos${DEPLOYMENT_TARGET}" \
-    -o "$APP/Contents/MacOS/claude-command-bar" "$ROOT/command_bar.swift"
+    -o "$APP/Contents/MacOS/PromptQy" "$ROOT/command_bar.swift"
 
 echo "==> Writing Info.plist (version $VERSION)"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -35,10 +35,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>            <string>Claude Command Bar</string>
-    <key>CFBundleDisplayName</key>     <string>Claude Command Bar</string>
-    <key>CFBundleIdentifier</key>      <string>io.github.claude-command-bar</string>
-    <key>CFBundleExecutable</key>      <string>claude-command-bar</string>
+    <key>CFBundleName</key>            <string>PromptQy</string>
+    <key>CFBundleDisplayName</key>     <string>PromptQy</string>
+    <key>CFBundleIdentifier</key>      <string>io.github.promptqy</string>
+    <key>CFBundleExecutable</key>      <string>PromptQy</string>
     <key>CFBundleVersion</key>         <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
@@ -55,11 +55,11 @@ PLIST
 
 # Prefer a stable self-signed identity (see setup_signing.sh) so TCC grants
 # (Accessibility/Automation) survive rebuilds; fall back to ad-hoc otherwise.
-CERT_NAME="Claude Command Bar Dev"
-DEV_KEYCHAIN="$HOME/Library/Keychains/claude-command-bar-dev.keychain-db"
+CERT_NAME="PromptQy Dev"
+DEV_KEYCHAIN="$HOME/Library/Keychains/promptqy-dev.keychain-db"
 if security find-certificate -c "$CERT_NAME" "$DEV_KEYCHAIN" >/dev/null 2>&1; then
     echo "==> Code signing with stable identity: $CERT_NAME"
-    security unlock-keychain -p "ccb-dev" "$DEV_KEYCHAIN" 2>/dev/null || true
+    security unlock-keychain -p "promptqy-dev" "$DEV_KEYCHAIN" 2>/dev/null || true
     codesign --force --keychain "$DEV_KEYCHAIN" --sign "$CERT_NAME" "$APP"
 else
     echo "==> Code signing (ad-hoc; run ./setup_signing.sh for a stable identity)"

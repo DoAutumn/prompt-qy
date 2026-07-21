@@ -1,4 +1,4 @@
-# Claude Command Bar
+# PromptQy
 
 [English](README.md) · **简体中文**
 
@@ -41,38 +41,38 @@
 ### 方式 A — Homebrew（推荐）
 
 ```bash
-brew install --cask DoAutumn/tap/claude-command-bar
+brew install --cask DoAutumn/tap/prompt-qy
 ```
 
-更新：`brew upgrade --cask claude-command-bar`。
-卸载并清理配置：`brew uninstall --zap --cask claude-command-bar`。
+更新：`brew upgrade --cask prompt-qy`。
+卸载并清理配置：`brew uninstall --zap --cask prompt-qy`。
 
 ### 方式 B — 一行命令安装
 
 ```bash
-curl -L -o /tmp/claude-command-bar.zip \
-  https://github.com/DoAutumn/claude-command-bar/releases/latest/download/Claude-Command-Bar.app.zip \
-  && unzip -oq /tmp/claude-command-bar.zip -d /Applications/ \
-  && xattr -dr com.apple.quarantine "/Applications/Claude Command Bar.app" \
-  && rm /tmp/claude-command-bar.zip \
-  && open "/Applications/Claude Command Bar.app"
+curl -L -o /tmp/prompt-qy.zip \
+  https://github.com/DoAutumn/prompt-qy/releases/latest/download/PromptQy.app.zip \
+  && unzip -oq /tmp/prompt-qy.zip -d /Applications/ \
+  && xattr -dr com.apple.quarantine "/Applications/PromptQy.app" \
+  && rm /tmp/prompt-qy.zip \
+  && open "/Applications/PromptQy.app"
 ```
 
 它做的事：拉取最新 Release → 解压到 `/Applications/` → 清掉 quarantine 标记（App 未签名/未公证，绕过 Gatekeeper）→ 启动。
 
-手动方式（不想跑脚本）：到 [Releases](https://github.com/DoAutumn/claude-command-bar/releases/latest) 下 `Claude-Command-Bar.app.zip`，解压拖进 `/Applications`，然后**右键 → 打开 → 在弹窗里再点一次「打开」**（仅一次）即可过 Gatekeeper。
+手动方式（不想跑脚本）：到 [Releases](https://github.com/DoAutumn/prompt-qy/releases/latest) 下 `PromptQy.app.zip`，解压拖进 `/Applications`，然后**右键 → 打开 → 在弹窗里再点一次「打开」**（仅一次）即可过 Gatekeeper。
 
 ### 方式 C — 从源码构建
 
 依赖 Xcode 命令行工具（`swiftc`），无需 Xcode 工程。
 
 ```bash
-git clone https://github.com/DoAutumn/claude-command-bar.git
-cd claude-command-bar
-./build_app.sh                                 # 产物：dist/Claude Command Bar.app
+git clone https://github.com/DoAutumn/prompt-qy.git
+cd prompt-qy
+./build_app.sh                                 # 产物：dist/PromptQy.app
 
-open "dist/Claude Command Bar.app"             # 首次运行
-cp -R "dist/Claude Command Bar.app" /Applications/   # 安装到应用程序
+open "dist/PromptQy.app"             # 首次运行
+cp -R "dist/PromptQy.app" /Applications/   # 安装到应用程序
 ```
 
 本地构建的 App **没有 quarantine 标记**，Gatekeeper 不会拦。
@@ -88,8 +88,8 @@ cp -R "dist/Claude Command Bar.app" /Applications/   # 安装到应用程序
 如果遇到「已授权但仍不生效」，通常是旧的失效授权残留，可以让系统重新索引 App、再重置该项授权，下次使用时会重新弹窗：
 
 ```bash
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/Claude Command Bar.app"
-tccutil reset AppleEvents io.github.claude-command-bar
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/PromptQy.app"
+tccutil reset AppleEvents io.github.promptqy
 ```
 
 ## 文件说明

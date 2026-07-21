@@ -5,14 +5,14 @@
 # grants across rebuilds — no more re-authorizing every time the code changes.
 #
 # It creates a dedicated, separate keychain (does NOT touch your login
-# keychain) holding one self-signed "Claude Command Bar Dev" certificate.
+# keychain) holding one self-signed "PromptQy Dev" certificate.
 #
 # Run once:  ./setup_signing.sh
 set -euo pipefail
 
-CERT_NAME="Claude Command Bar Dev"
-KEYCHAIN="$HOME/Library/Keychains/claude-command-bar-dev.keychain-db"
-KC_PASS="ccb-dev"      # password of the dedicated keychain (local dev only)
+CERT_NAME="PromptQy Dev"
+KEYCHAIN="$HOME/Library/Keychains/promptqy-dev.keychain-db"
+KC_PASS="promptqy-dev"  # password of the dedicated keychain (local dev only)
 
 has_cert() { security find-certificate -c "$CERT_NAME" "$KEYCHAIN" >/dev/null 2>&1; }
 
@@ -52,7 +52,7 @@ EOF
 fi
 
 # Ensure the keychain is on the user search list so codesign can find the identity.
-if ! security list-keychains -d user | sed 's/"//g' | grep -q "claude-command-bar-dev"; then
+if ! security list-keychains -d user | sed 's/"//g' | grep -q "promptqy-dev"; then
     echo "==> Adding keychain to search list"
     OLD=$(security list-keychains -d user | sed 's/"//g' | xargs)
     security list-keychains -d user -s $OLD "$KEYCHAIN"

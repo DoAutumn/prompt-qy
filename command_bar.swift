@@ -1,4 +1,4 @@
-// Claude Command Bar — a menu-bar-resident, always-on-top text composer for
+// PromptQy — a menu-bar-resident, always-on-top text composer for
 // feeding prompts, file paths, selections and screenshots into a terminal
 // running Claude Code.
 //
@@ -798,7 +798,7 @@ final class EditorPanel: NSPanel {
             backing: .buffered,
             defer: false)
 
-        title = "Claude Command Bar"
+        title = "PromptQy"
         isFloatingPanel = true
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -936,7 +936,7 @@ final class EditorPanel: NSPanel {
                 alert.informativeText =
                     "AppleScript 错误：\(e)\n\n"
                     + "多半是自动化权限：请到「系统设置 → 隐私与安全性 → 自动化」，"
-                    + "允许「Claude Command Bar」控制终端与 System Events。"
+                    + "允许「PromptQy」控制终端与 System Events。"
             } else {
                 alert.messageText = "未找到运行中的 \(scope) 窗口"
                 alert.informativeText =
@@ -1004,7 +1004,7 @@ final class EditorPanel: NSPanel {
             alert.informativeText =
                 (AppleScriptRunner.lastError ?? "未知错误")
                 + "\n\n编辑器内容已保留。若是权限问题，请到「系统设置 → 隐私与安全性 → 自动化」，"
-                + "允许「Claude Command Bar」控制 \(target.app.displayName) 与 System Events。"
+                + "允许「PromptQy」控制 \(target.app.displayName) 与 System Events。"
             alert.runModal()
             return
         }
@@ -1263,7 +1263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 button.image = icon
             } else {
                 button.image = NSImage(
-                    systemSymbolName: "text.cursor", accessibilityDescription: "Claude Command Bar")
+                    systemSymbolName: "text.cursor", accessibilityDescription: "PromptQy")
             }
         }
         let menu = NSMenu()
@@ -1376,7 +1376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = "需要「辅助功能」权限"
         alert.informativeText =
             "双击 Control 呼出、读取选中文本都依赖全局键盘监听。\n"
-            + "请在「辅助功能」列表中勾选「Claude Command Bar」。若已勾选仍提示，"
+            + "请在「辅助功能」列表中勾选「PromptQy」。若已勾选仍提示，"
             + "请先移除旧条目再重新添加本 App。"
         alert.addButton(withTitle: "打开辅助功能设置")
         alert.addButton(withTitle: "稍后")

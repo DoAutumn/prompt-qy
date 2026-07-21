@@ -1,4 +1,4 @@
-# Claude Command Bar
+# PromptQy
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -41,38 +41,38 @@ Every inserted path / selection is followed by a newline, so items stack on thei
 ### Option A — Homebrew (recommended)
 
 ```bash
-brew install --cask DoAutumn/tap/claude-command-bar
+brew install --cask DoAutumn/tap/prompt-qy
 ```
 
-To update: `brew upgrade --cask claude-command-bar`.
-To remove it and its preferences: `brew uninstall --zap --cask claude-command-bar`.
+To update: `brew upgrade --cask prompt-qy`.
+To remove it and its preferences: `brew uninstall --zap --cask prompt-qy`.
 
 ### Option B — one-line install
 
 ```bash
-curl -L -o /tmp/claude-command-bar.zip \
-  https://github.com/DoAutumn/claude-command-bar/releases/latest/download/Claude-Command-Bar.app.zip \
-  && unzip -oq /tmp/claude-command-bar.zip -d /Applications/ \
-  && xattr -dr com.apple.quarantine "/Applications/Claude Command Bar.app" \
-  && rm /tmp/claude-command-bar.zip \
-  && open "/Applications/Claude Command Bar.app"
+curl -L -o /tmp/prompt-qy.zip \
+  https://github.com/DoAutumn/prompt-qy/releases/latest/download/PromptQy.app.zip \
+  && unzip -oq /tmp/prompt-qy.zip -d /Applications/ \
+  && xattr -dr com.apple.quarantine "/Applications/PromptQy.app" \
+  && rm /tmp/prompt-qy.zip \
+  && open "/Applications/PromptQy.app"
 ```
 
 What it does: pull the latest release → unzip into `/Applications/` → strip quarantine (bypass Gatekeeper, since the app is unsigned/unnotarized) → launch.
 
-Manual (if you'd rather not run a script): grab `Claude-Command-Bar.app.zip` from [Releases](https://github.com/DoAutumn/claude-command-bar/releases/latest), unzip and drag it to `/Applications`, then **right-click → Open → click Open again in the dialog** (only once) to get past Gatekeeper.
+Manual (if you'd rather not run a script): grab `PromptQy.app.zip` from [Releases](https://github.com/DoAutumn/prompt-qy/releases/latest), unzip and drag it to `/Applications`, then **right-click → Open → click Open again in the dialog** (only once) to get past Gatekeeper.
 
 ### Option C — build from source
 
 Requires the Xcode Command Line Tools (`swiftc`); no Xcode project needed.
 
 ```bash
-git clone https://github.com/DoAutumn/claude-command-bar.git
-cd claude-command-bar
-./build_app.sh                                 # output: dist/Claude Command Bar.app
+git clone https://github.com/DoAutumn/prompt-qy.git
+cd prompt-qy
+./build_app.sh                                 # output: dist/PromptQy.app
 
-open "dist/Claude Command Bar.app"             # first run
-cp -R "dist/Claude Command Bar.app" /Applications/   # install to Applications
+open "dist/PromptQy.app"             # first run
+cp -R "dist/PromptQy.app" /Applications/   # install to Applications
 ```
 
 Building locally means the app has **no quarantine flag**, so Gatekeeper won't block it.
@@ -88,8 +88,8 @@ First use will prompt for (grant each once):
 If you hit "granted but still not working", it's usually a stale grant. Reindex the app and reset the service so it prompts again:
 
 ```bash
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/Claude Command Bar.app"
-tccutil reset AppleEvents io.github.claude-command-bar
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/PromptQy.app"
+tccutil reset AppleEvents io.github.promptqy
 ```
 
 ## Files

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cut a release: bump VERSION → build → zip → GitHub Release → update the
-# Homebrew cask so `brew upgrade --cask claude-command-bar` picks it up.
+# Homebrew cask so `brew upgrade --cask prompt-qy` picks it up.
 #
 #   ./release.sh 0.1.2
 #
@@ -9,12 +9,14 @@
 set -euo pipefail
 
 TAP_REPO="DoAutumn/homebrew-tap"
+GH_REPO="DoAutumn/prompt-qy"
+CASK_TOKEN="prompt-qy"
 
 VERSION="${1:-}"
 [ -n "$VERSION" ] || { echo "usage: ./release.sh <version>   e.g. ./release.sh 0.1.2"; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-ZIP="$ROOT/dist/Claude-Command-Bar.app.zip"
+ZIP="$ROOT/dist/PromptQy.app.zip"
 TAG="v$VERSION"
 
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || { echo "!! working tree is dirty — commit first"; exit 1; }
@@ -54,8 +56,8 @@ else
     echo "==> Cloning $TAP_REPO"
     git clone -q "https://github.com/$TAP_REPO.git" "$TAP"
 fi
-CASK="$TAP/Casks/claude-command-bar.rb"
-[ -f "$CASK" ] || { echo "!! cask not found: $CASK"; exit 1; }
+CASK="$TAP/Casks/${CASK_TOKEN}.rb"
+OLD_CASK="$TAP/Casks/claude-command-bar.rb"
 
 echo "$VERSION" > "$ROOT/VERSION"
 
@@ -68,18 +70,54 @@ git -C "$ROOT" tag "$TAG"
 git -C "$ROOT" push origin HEAD "$TAG"
 
 echo "==> Creating GitHub release $TAG"
-gh release create "$TAG" "$ZIP" --repo DoAutumn/claude-command-bar --generate-notes
+gh release create "$TAG" "$ZIP" --repo "$GH_REPO" --generate-notes
 
 # The cask pins a checksum, so it must be recomputed from the exact artifact the
 # release serves. Hash the local zip — it is byte-identical to what was uploaded.
 SHA="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
-echo "==> Updating cask to $VERSION ($SHA)"
-/usr/bin/sed -i '' \
-    -e "s|^  version \".*\"|  version \"$VERSION\"|" \
-    -e "s|^  sha256 \".*\"|  sha256 \"$SHA\"|" \
-    "$CASK"
+echo "==> Writing cask $CASK_TOKEN $VERSION ($SHA)"
+cat > "$CASK" <<CASK
+cask "$CASK_TOKEN" do
+  version "$VERSION"
+  sha256 "$SHA"
 
-git -C "$TAP" commit -am "claude-command-bar $VERSION"
+  url "https://github.com/$GH_REPO/releases/download/v#{version}/PromptQy.app.zip"
+  name "PromptQy"
+  desc "Menu-bar composer that feeds text, paths and screenshots to Claude Code"
+  homepage "https://github.com/$GH_REPO"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: :big_sur
+
+  app "PromptQy.app"
+
+  # The app is not Apple-notarized, so Homebrew's quarantine flag would make
+  # Gatekeeper refuse the first launch ("damaged, move to Trash"). Strip it here
+  # rather than making every user remember \`--no-quarantine\` on install *and*
+  # upgrade. Only possible in a third-party tap; homebrew-cask forbids this.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/PromptQy.app"]
+  end
+
+  uninstall quit: "io.github.promptqy"
+
+  zap trash: [
+    "~/Library/Preferences/io.github.promptqy.plist",
+    "~/Library/Saved Application State/io.github.promptqy.savedState",
+  ]
+end
+CASK
+
+# Drop the legacy cask token so installs go through prompt-qy only.
+rm -f "$OLD_CASK"
+
+git -C "$TAP" add -A
+git -C "$TAP" commit -m "prompt-qy $VERSION (rename from claude-command-bar)"
 # The tap is cloned over https, so pushing needs a git credential helper — which
 # `gh auth login` alone does not set up. Say so instead of dying on git's
 # "could not read Username": the release is already out at this point and only
@@ -94,4 +132,5 @@ git -C "$TAP" push || {
 
 echo
 echo "==> Released $TAG"
-echo "    brew upgrade --cask claude-command-bar"
+echo "    brew install --cask DoAutumn/tap/prompt-qy"
+echo "    brew upgrade --cask prompt-qy"
