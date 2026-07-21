@@ -6,7 +6,7 @@
 
 When you drive Claude Code from the terminal, you constantly feed it file paths, code snippets, error messages and screenshots — copy, switch window, paste, repeat. This little tool collapses those steps into an always-on-top editor you summon with a double-tap.
 
-> ⚠️ Personal tool, not an Anthropic product. Currently targets **Terminal.app** only.
+> ⚠️ Personal tool, not an Anthropic product. Targets **Terminal.app** and **iTerm2** (pick one or auto in Settings).
 
 ## Features
 
@@ -17,9 +17,10 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Double-tap Option** to insert the current Finder selection's paths
 - **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
-- **One-key send**: ⌘↵ → if several terminal windows exist, pick one by title → text is pasted into Claude and submitted; the editor clears
+- **One-key send**: ⌘↵ → if several terminal windows/tabs exist, pick one by title → text is pasted into Claude and submitted; the editor clears
+- **Terminal.app & iTerm2**: send to either (or auto-detect); choose the target in Settings
 - **History** of sent messages in the menu; click to reload into the editor
-- **Customizable**: the three double-tap modifiers, history size, menu label width (menu → Settings…)
+- **Customizable**: the three double-tap modifiers, target terminal, history size, menu label width (menu → Settings…)
 
 ## Gestures
 
@@ -30,8 +31,8 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 | Double-tap **Command** | Open the current Finder selection in Sublime Text |
 | Drag a file into the editor | Insert its path |
 | ⌘⇧4 screenshot | Insert the new screenshot's path |
-| **⌘↵** | Send to the terminal (pick a window if several) |
-| **Esc** | Hide the editor |
+| **⌘↵** | Send to the terminal (pick a window/tab if several) |
+| **Esc** / **⌘W** | Hide the editor |
 | ⌘A / ⌘C / ⌘V / ⌘X / ⌘Z | Standard editing inside the editor |
 
 Every inserted path / selection is followed by a newline, so items stack on their own lines.
@@ -82,7 +83,7 @@ Building locally means the app has **no quarantine flag**, so Gatekeeper won't b
 First use will prompt for (grant each once):
 
 - **Accessibility** — global key monitoring (double-tap summon), reading the selection, synthesizing keys
-- **Automation** — controlling Finder and Terminal.app (enumerating windows, sending text)
+- **Automation** — controlling Finder, Terminal.app and/or iTerm2 (enumerating windows/tabs, sending text)
 - **Desktop folder** — watching the screenshot directory
 
 If you hit "granted but still not working", it's usually a stale grant. Reindex the app and reset the service so it prompts again:

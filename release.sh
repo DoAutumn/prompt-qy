@@ -54,7 +54,7 @@ else
     TAP="$(mktemp -d)/homebrew-tap"
     trap 'rm -rf "$(dirname "$TAP")"' EXIT
     echo "==> Cloning $TAP_REPO"
-    git clone -q "https://github.com/$TAP_REPO.git" "$TAP"
+    git clone -q "git@github.com:$TAP_REPO.git" "$TAP"
 fi
 CASK="$TAP/Casks/${CASK_TOKEN}.rb"
 OLD_CASK="$TAP/Casks/claude-command-bar.rb"

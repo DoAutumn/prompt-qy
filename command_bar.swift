@@ -818,6 +818,10 @@ final class EditorPanel: NSPanel {
     /// responder-chain backstop.
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
 
+    /// ⌘W (and the red traffic-light) should hide, not destroy — the panel is
+    /// reused across summons (`isReleasedWhenClosed = false`).
+    override func close() { orderOut(nil) }
+
     private func buildContent() {
         let container = NSView()
 
@@ -1226,8 +1230,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// An accessory (LSUIElement) app has no menu bar, but a main menu is still
-    /// needed for the standard editing key-equivalents (⌘A/⌘C/⌘V/⌘X/⌘Z) to
-    /// reach the text view.
+    /// needed for the standard editing key-equivalents (⌘A/⌘C/⌘V/⌘X/⌘Z/⌘W) to
+    /// reach the text view / key window.
     private func setupMainMenu() {
         let mainMenu = NSMenu()
 
@@ -1237,6 +1241,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appMenu.addItem(
             withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+
+        let fileItem = NSMenuItem()
+        mainMenu.addItem(fileItem)
+        let fileMenu = NSMenu(title: "文件")
+        // Routes ⌘W to the key window's performClose: → EditorPanel.close().
+        fileMenu.addItem(
+            withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileItem.submenu = fileMenu
 
         let editItem = NSMenuItem()
         mainMenu.addItem(editItem)
