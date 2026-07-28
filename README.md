@@ -20,7 +20,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **One-key send**: ⌘↵ → if several terminal windows/tabs exist, pick one by title → text is pasted into Claude and submitted; the editor clears
 - **Terminal.app & iTerm2**: send to either (or auto-detect); choose the target in Settings
 - **History** of sent messages in the menu; click to reload into the editor
-- **Customizable**: the three double-tap modifiers, target terminal, history size, menu label width (menu → Settings…)
+- **Customizable**: the three double-tap modifiers, target terminal, history size, menu label width, and the ⌘⇧4 screenshot save folder (writes the system preference so it survives reboot; menu → Settings…)
 
 ## Gestures
 
@@ -84,7 +84,7 @@ First use will prompt for (grant each once):
 
 - **Accessibility** — global key monitoring (double-tap summon), reading the selection, synthesizing keys
 - **Automation** — controlling Finder, Terminal.app and/or iTerm2 (enumerating windows/tabs, sending text)
-- **Desktop folder** — watching the screenshot directory
+- **Screenshot folder** — watching the system screenshot save directory (Desktop by default; changeable in Settings)
 
 If you hit "granted but still not working", it's usually a stale grant. Reindex the app and reset the service so it prompts again:
 

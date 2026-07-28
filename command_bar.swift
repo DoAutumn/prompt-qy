@@ -287,17 +287,6 @@ enum TerminalApp: String, CaseIterable {
         }
     }
 
-    /// What System Events calls the process. Not interchangeable with the
-    /// AppleScript name: iTerm2's app object answers to "iTerm", its process
-    /// is "iTerm2". Addressing the app by bundle id sidesteps that entirely,
-    /// but `frontmost of process` still needs the process name.
-    var processName: String {
-        switch self {
-        case .terminal: return "Terminal"
-        case .iterm: return "iTerm2"
-        }
-    }
-
     var displayName: String {
         switch self {
         case .terminal: return "终端.app"
@@ -500,33 +489,29 @@ enum TerminalSender {
     /// Send is usually triggered by ⌘↵, so the user is often still physically
     /// holding ⌘ (and maybe ⇧/⌥) when we synthesize the paste. A lingering ⌘
     /// turns our Return into ⌘↵ — which Claude Code won't submit — and can
-    /// corrupt the ⌘V too. Wait (briefly) for every modifier to come back up
-    /// before handing off to Terminal.
-    private static func waitForModifiersReleased(timeout: TimeInterval = 0.7) {
+    /// corrupt the ⌘V too. Wait for every modifier to come back up; fail rather
+    /// than proceeding while they're still down (the old timeout-and-continue
+    /// path was a silent source of "sent but empty" reports).
+    private static func waitForModifiersReleased(timeout: TimeInterval = 1.2) -> Bool {
         let watched: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if NSEvent.modifierFlags.intersection(watched).isEmpty { return }
+            if NSEvent.modifierFlags.intersection(watched).isEmpty { return true }
             usleep(10_000)
         }
+        return NSEvent.modifierFlags.intersection(watched).isEmpty
     }
 
-    /// Put the text on the clipboard, focus the target tab, then paste + Return.
-    /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
-    /// so the caller can keep the text instead of silently dropping it.
-    static func send(_ text: String, to target: Target) -> Bool {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-
-        waitForModifiersReleased()
-
-        // Focusing differs: Terminal.app selects a tab and raises the window by
-        // property, iTerm2 has a `select` verb that walks window → tab → pane.
-        // (iTerm2 also has `write text`, which needs no focus at all — but it
-        // replays embedded newlines as Return presses, so a multi-line prompt
-        // would submit itself line by line. Pasting keeps it intact, because
-        // the terminal wraps a real ⌘V in bracketed paste.)
+    /// Select the target window/tab/pane. Keystrokes are posted separately —
+    /// this script only moves focus inside the terminal app.
+    ///
+    /// Focusing differs: Terminal.app selects a tab and raises the window by
+    /// property; iTerm2 has a `select` verb that walks window → tab → pane.
+    /// (iTerm2 also has `write text`, which needs no focus at all — but it
+    /// replays embedded newlines as Return presses, so a multi-line prompt
+    /// would submit itself line by line. Pasting keeps it intact, because
+    /// the terminal wraps a real ⌘V in bracketed paste.)
+    private static func focusTab(_ target: Target) -> Bool {
         let focus: String
         switch target.app {
         case .terminal:
@@ -541,13 +526,6 @@ enum TerminalSender {
             select session id "\(target.sessionId)" of tab \(target.tabIndex) of targetWin
             """
         }
-
-        // `activate` is asynchronous. A blind `delay` races it: if the terminal
-        // isn't frontmost yet, the synthesized ⌘V + Return land in whatever app
-        // still is (often our own floating editor) — pasting nowhere useful and
-        // never submitting. Poll until it genuinely owns the front, then paste;
-        // report failure if it never gets there so the caller keeps the text
-        // instead of quietly dropping it.
         let script = """
         tell application id "\(target.app.bundleId)"
             set targetWin to window id \(target.windowId)
@@ -555,31 +533,103 @@ enum TerminalSender {
                 set miniaturized of targetWin to false
             end try
         \(focus)
-            activate
         end tell
-        tell application "System Events"
-            set gotFront to false
-            repeat 100 times
-                if frontmost of process "\(target.app.processName)" then
-                    set gotFront to true
-                    exit repeat
-                end if
-                delay 0.02
-            end repeat
-            if not gotFront then return "notfront"
-            delay 0.06
-            keystroke "v" using command down
-            delay 0.05
-            key code 36
-        end tell
-        return "ok"
         """
-        guard let result = AppleScriptRunner.run(script) else { return false }
-        if result != "ok" {
+        return AppleScriptRunner.succeeds(script)
+    }
+
+    /// Wait until LaunchServices agrees the target owns the front. System
+    /// Events' `frontmost of process` (AX) can flip true while *we* are still
+    /// the LaunchServices-active app — and synthetic keystrokes follow LS, not
+    /// AX. Polling the wrong frontness is how pastes silently land in our own
+    /// floating editor (⌘V into text we already hold → no visible change →
+    /// caller clears the prompt thinking it succeeded).
+    private static func waitUntilFrontmost(_ app: TerminalApp, timeout: TimeInterval = 2.0) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == app.bundleId {
+                return true
+            }
+            usleep(20_000)
+        }
+        return NSWorkspace.shared.frontmostApplication?.bundleIdentifier == app.bundleId
+    }
+
+    /// Post a key chord through the HID tap so it reaches whichever app is
+    /// actually frontmost (same path SelectionReader uses for ⌘C).
+    private static func postKey(_ virtualKey: CGKeyCode, flags: CGEventFlags) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(keyboardEventSource: src, virtualKey: virtualKey, keyDown: true)
+        down?.flags = flags
+        let up = CGEvent(keyboardEventSource: src, virtualKey: virtualKey, keyDown: false)
+        up?.flags = flags
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+    }
+
+    /// Put the text on the clipboard, focus the target tab, then paste + Return.
+    /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
+    /// so the caller can keep the text instead of silently dropping it.
+    ///
+    /// Caller must already have resigned our own key focus (`orderOut` +
+    /// `NSApp.deactivate`); otherwise the terminal can never become the
+    /// LaunchServices-frontmost app and the paste vanishes into us.
+    static func send(_ text: String, to target: Target) -> Bool {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard pb.setString(text, forType: .string) else {
+            AppleScriptRunner.lastError = "无法写入剪贴板"
+            return false
+        }
+
+        guard waitForModifiersReleased() else {
+            AppleScriptRunner.lastError =
+                "修饰键仍按着（⌘/⌥/⌃/⇧）。请松开后再发送，否则粘贴/回车会被改写。"
+            return false
+        }
+
+        guard focusTab(target) else { return false }
+
+        guard let running = NSRunningApplication
+            .runningApplications(withBundleIdentifier: target.app.bundleId).first else {
+            AppleScriptRunner.lastError = "\(target.app.displayName) 已退出"
+            return false
+        }
+        // IgnoringOtherApps is required for an LSUIElement sender: without it,
+        // activate is a no-op when another "real" app is already active.
+        running.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+
+        guard waitUntilFrontmost(target.app) else {
             AppleScriptRunner.lastError =
                 "\(target.app.displayName) 窗口未能切到前台，内容已保留，请重试。"
             return false
         }
+
+        // Tab selection + activate both settle asynchronously; a short beat
+        // after LS-frontmost keeps ⌘V from landing on a half-focused pane.
+        usleep(100_000)
+
+        // Clipboard can be stolen between setString and paste (clipboard
+        // managers, other monitors). Refuse rather than pasting the wrong thing
+        // and then clearing the editor.
+        guard pb.string(forType: .string) == text else {
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            AppleScriptRunner.lastError =
+                "剪贴板在发送前被其他程序改写，内容已保留，请重试。"
+            return false
+        }
+
+        // 0x09 = 'v', 0x24 = Return. HID tap, not System Events keystroke —
+        // the latter has no target and races the same AX/LS frontmost split.
+        postKey(0x09, flags: .maskCommand)
+
+        // Bracketed paste needs a moment before Return, else Claude Code sees
+        // an empty submit and the paste arrives after. Scale lightly with size.
+        let pasteSettle = UInt32(min(500_000, 60_000 + text.utf8.count * 20))
+        usleep(pasteSettle)
+
+        postKey(0x24, flags: [])
         return true
     }
 }
@@ -600,17 +650,23 @@ final class ScreenshotWatcher {
         self.onNew = onNew
     }
 
-    private static func resolveDir() -> URL {
-        if let loc = UserDefaults(suiteName: "com.apple.screencapture")?
-            .string(forKey: "location"), !loc.isEmpty {
-            return URL(fileURLWithPath: (loc as NSString).expandingTildeInPath)
+    /// Stop watching. Safe to call when not started.
+    func stop() {
+        source?.setEventHandler {}
+        source?.setCancelHandler {}
+        source?.cancel()
+        source = nil
+        if fd >= 0 {
+            close(fd)
+            fd = -1
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop")
     }
 
+    /// (Re)start watching `ScreenshotLocation.url`. Call after the save path
+    /// changes so new captures are still picked up.
     func start() {
-        dir = Self.resolveDir()
+        stop()
+        dir = ScreenshotLocation.url
         seen = currentImages()
         fd = open(dir.path, O_EVTONLY)
         guard fd >= 0 else {
@@ -620,9 +676,6 @@ final class ScreenshotWatcher {
         let s = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
         s.setEventHandler { [weak self] in self?.scan() }
-        s.setCancelHandler { [weak self] in
-            if let f = self?.fd, f >= 0 { close(f) }
-        }
         source = s
         s.resume()
     }
@@ -663,30 +716,89 @@ final class ScreenshotWatcher {
     }
 }
 
-// MARK: - Screenshot thumbnail preference
+// MARK: - Screenshot preferences (system `com.apple.screencapture`)
+
+/// Shared reload for screencapture prefs. Writing the domain alone is not
+/// enough — SystemUIServer caches the values until restarted.
+private enum ScreenshotPrefs {
+    static let domain = "com.apple.screencapture"
+
+    static func reloadService() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        p.arguments = ["SystemUIServer"]
+        try? p.run()
+        // Newer macOS keeps a separate UI helper that also caches location.
+        let ui = Process()
+        ui.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        ui.arguments = ["screencaptureui"]
+        try? ui.run()
+    }
+}
+
+/// macOS ⌘⇧3 / ⌘⇧4 save directory. Persisted in the system screencapture
+/// domain (survives reboot); we read/write it and restart the screenshot
+/// service so the change applies immediately.
+enum ScreenshotLocation {
+    private static let key = "location"
+
+    static var defaultURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop")
+    }
+
+    static var url: URL {
+        if let loc = UserDefaults(suiteName: ScreenshotPrefs.domain)?
+            .string(forKey: key), !loc.isEmpty {
+            return URL(fileURLWithPath: (loc as NSString).expandingTildeInPath)
+        }
+        return defaultURL
+    }
+
+    /// Home-relative display form (`~/Desktop/...`) for the settings row.
+    static var displayPath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let p = url.path
+        if p == home { return "~" }
+        if p.hasPrefix(home + "/") {
+            return "~" + p.dropFirst(home.count)
+        }
+        return p
+    }
+
+    /// Write the system screenshot location. Returns false if `url` is not an
+    /// existing directory. Survives reboot via the screencapture defaults domain.
+    @discardableResult
+    static func setURL(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        let resolved = url.resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir),
+              isDir.boolValue else { return false }
+        UserDefaults(suiteName: ScreenshotPrefs.domain)?.set(resolved.path, forKey: key)
+        UserDefaults(suiteName: ScreenshotPrefs.domain)?.synchronize()
+        ScreenshotPrefs.reloadService()
+        return true
+    }
+}
 
 /// Toggles macOS's screenshot floating thumbnail. While the thumbnail is shown
 /// (the default), the capture is held in memory for ~5s and only written to disk
 /// after it dismisses — so our watcher can't insert the path until then.
 /// Turning it off makes captures save (and insert) immediately.
 enum ScreenshotThumbnail {
-    private static let domain = "com.apple.screencapture"
     private static let key = "show-thumbnail"
 
     /// True when the thumbnail is disabled (i.e. captures save immediately).
     static var isDisabled: Bool {
-        guard let v = UserDefaults(suiteName: domain)?.object(forKey: key) as? Bool
+        guard let v = UserDefaults(suiteName: ScreenshotPrefs.domain)?
+            .object(forKey: key) as? Bool
         else { return false }  // unset ⇒ thumbnail shown ⇒ not disabled
         return v == false
     }
 
     static func setDisabled(_ disabled: Bool) {
-        UserDefaults(suiteName: domain)?.set(!disabled, forKey: key)
-        // Restart SystemUIServer so the screenshot service picks up the change.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        p.arguments = ["SystemUIServer"]
-        try? p.run()
+        UserDefaults(suiteName: ScreenshotPrefs.domain)?.set(!disabled, forKey: key)
+        ScreenshotPrefs.reloadService()
     }
 }
 
@@ -1000,9 +1112,20 @@ final class EditorPanel: NSPanel {
     }
 
     private func deliver(_ text: String, to target: TerminalSender.Target) {
+        // Resign key focus *before* activating the terminal. Our floating
+        // panel otherwise stays the LaunchServices-active app while System
+        // Events already reports the terminal as AX-frontmost — synthetic
+        // keystrokes follow LS, land in our own editor (⌘V into text we
+        // already hold → looks like a no-op), and we used to clear the prompt
+        // thinking the paste succeeded.
+        orderOut(nil)
+        NSApp.deactivate()
+
         guard TerminalSender.send(text, to: target) else {
             // Keep the text — losing a composed prompt to a silent failure is
             // far worse than an extra dialog.
+            showAndFocus()
+            setText(text)
             let alert = NSAlert()
             alert.messageText = "发送失败"
             alert.informativeText =
@@ -1014,9 +1137,6 @@ final class EditorPanel: NSPanel {
         }
         HistoryStore.add(text)
         textView.string = ""
-        // Sending is the end of the interaction — the panel has nothing left to
-        // show, and the terminal is now frontmost anyway. Failures keep it open.
-        orderOut(nil)
     }
 
     /// Boxed payload for the tab-picker menu items.
@@ -1038,8 +1158,8 @@ final class SettingsWindowController: NSObject {
     /// stretches to the full content width and the extra space lands inside the
     /// (trailing-aligned) label column — which shoves the whole block right.
     private static let labelWidth: CGFloat = 190
-    private static let controlWidth: CGFloat = 140
-    private static let windowWidth: CGFloat = 400
+    private static let controlWidth: CGFloat = 180
+    private static let windowWidth: CGFloat = 460
     private static let margin: CGFloat = 20
 
     private var window: NSWindow?
@@ -1050,6 +1170,8 @@ final class SettingsWindowController: NSObject {
     private let openPopup = NSPopUpButton()
     private let historyPopup = NSPopUpButton()
     private let widthPopup = NSPopUpButton()
+    private let pathLabel = NSTextField(labelWithString: "")
+    private let choosePathButton = NSButton(title: "选择…", target: nil, action: nil)
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
@@ -1085,6 +1207,21 @@ final class SettingsWindowController: NSObject {
             popup.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
         }
 
+        pathLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        pathLabel.lineBreakMode = .byTruncatingMiddle
+        pathLabel.toolTip = ScreenshotLocation.url.path
+        pathLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        choosePathButton.bezelStyle = .rounded
+        choosePathButton.target = self
+        choosePathButton.action = #selector(chooseScreenshotPath)
+        choosePathButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        let pathRow = NSStackView(views: [pathLabel, choosePathButton])
+        pathRow.orientation = .horizontal
+        pathRow.spacing = 8
+        pathRow.alignment = .centerY
+        pathRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+
         func row(_ label: String, _ control: NSView) -> [NSView] {
             let l = NSTextField(labelWithString: label)
             l.alignment = .right
@@ -1097,6 +1234,7 @@ final class SettingsWindowController: NSObject {
             row("双击用 \(ExternalEditor.displayName) 打开：", openPopup),
             row("历史保留条数：", historyPopup),
             row("菜单标题最大字数：", widthPopup),
+            row("⌘⇧4 截图保存路径：", pathRow),
         ])
         grid.rowSpacing = 12
         grid.columnSpacing = 10
@@ -1112,7 +1250,8 @@ final class SettingsWindowController: NSObject {
 
         let textWidth = Self.windowWidth - Self.margin * 2
         let note = NSTextField(wrappingLabelWithString:
-            "三个双击手势请用不同的修饰键，否则会冲突。改动即时生效。")
+            "三个双击手势请用不同的修饰键，否则会冲突。"
+            + "截图路径写入系统设置（com.apple.screencapture），重启后仍生效。改动即时生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
         note.alignment = .center
@@ -1164,6 +1303,8 @@ final class SettingsWindowController: NSObject {
         widthPopup.selectItem(withTitle: "\(Settings.labelWidth)")
         terminalPopup.selectItem(at: Settings.terminalApp
             .flatMap { TerminalApp.allCases.firstIndex(of: $0) }.map { $0 + 1 } ?? 0)
+        pathLabel.stringValue = ScreenshotLocation.displayPath
+        pathLabel.toolTip = ScreenshotLocation.url.path
     }
 
     @objc private func changed() {
@@ -1174,6 +1315,28 @@ final class SettingsWindowController: NSObject {
         if let w = Int(widthPopup.titleOfSelectedItem ?? "") { Settings.labelWidth = w }
         let i = terminalPopup.indexOfSelectedItem
         Settings.terminalApp = i > 0 ? TerminalApp.allCases[i - 1] : nil
+        onChange()
+    }
+
+    @objc private func chooseScreenshotPath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "选择"
+        panel.message = "选择 ⌘⇧3 / ⌘⇧4 截图的保存文件夹（写入系统设置，重启后仍生效）"
+        panel.directoryURL = ScreenshotLocation.url
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard ScreenshotLocation.setURL(url) else {
+            let alert = NSAlert()
+            alert.messageText = "无法设置截图路径"
+            alert.informativeText = "请选择一个已存在且可访问的文件夹。"
+            alert.runModal()
+            return
+        }
+        pathLabel.stringValue = ScreenshotLocation.displayPath
+        pathLabel.toolTip = ScreenshotLocation.url.path
         onChange()
     }
 }
@@ -1189,6 +1352,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenshotWatcher: ScreenshotWatcher!
     private lazy var settingsController = SettingsWindowController { [weak self] in
         self?.restartMonitors()
+        // Path may have changed via the screenshot-location picker.
+        self?.screenshotWatcher.start()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
