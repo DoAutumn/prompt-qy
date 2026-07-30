@@ -11,13 +11,15 @@
 //   3. Drag files onto the editor to insert their paths + a double-tap Option
 //      hotkey to insert the Finder selection.
 //   4. Watch the screenshot folder and insert the path of new screenshots.
-//
-// Later stages: history store + settings window (customizable shortcuts/count).
+//   5. Push-to-talk dictation: hold a key (default right Option) to stream
+//      speech recognition into the editor via SFSpeechRecognizer.
 //
 // Build via ./build_app.sh.
 
 import Cocoa
 import ApplicationServices
+import Speech
+import AVFoundation
 
 // MARK: - Settings
 
@@ -82,6 +84,11 @@ enum Settings {
     static var terminalApp: TerminalApp? {
         get { TerminalApp(rawValue: d.string(forKey: "terminalApp") ?? "") }
         set { d.set(newValue?.rawValue ?? "auto", forKey: "terminalApp") }
+    }
+    /// Key code to hold for push-to-talk dictation. 0x3D = right Option (default).
+    static var dictationKeyCode: UInt16 {
+        get { let v = d.integer(forKey: "dictationKeyCode"); return v != 0 ? UInt16(v) : 0x3D }
+        set { d.set(Int(newValue), forKey: "dictationKeyCode") }
     }
 }
 
@@ -868,6 +875,128 @@ final class DoubleTapMonitor {
     }
 }
 
+// MARK: - Voice recognizer
+
+/// Thin wrapper around SFSpeechRecognizer + AVAudioEngine for real-time,
+/// streaming dictation. Supports push-to-talk via partial/final callbacks.
+final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
+    private let speechRecognizer: SFSpeechRecognizer
+    private let audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+
+    /// Called on the main thread with partial (in-progress) transcription.
+    var onPartialResult: ((String) -> Void)?
+    /// Called on the main thread with the final transcription.
+    var onFinalResult: ((String) -> Void)?
+    /// Called when recording state changes (started / stopped).
+    var onStateChange: ((Bool) -> Void)?
+    /// Called on error (permission denied, network, etc.).
+    var onError: ((String) -> Void)?
+
+    var isRecording: Bool { audioEngine.isRunning }
+
+    init(locale: Locale = Locale(identifier: "zh-CN")) {
+        speechRecognizer = SFSpeechRecognizer(locale: locale)!
+        super.init()
+        speechRecognizer.delegate = self
+    }
+
+    /// Request speech-recognition authorization. Must be called before recording.
+    /// The system also prompts for microphone permission on first use of
+    /// AVAudioEngine.inputNode.
+    static func requestPermission(completion: @escaping (Bool) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { status in
+            DispatchQueue.main.async {
+                completion(status == .authorized)
+            }
+        }
+    }
+
+    static var permissionStatus: SFSpeechRecognizerAuthorizationStatus {
+        SFSpeechRecognizer.authorizationStatus()
+    }
+
+    func startRecording() throws {
+        // Cancel any previous task
+        recognitionTask?.cancel()
+        recognitionTask = nil
+
+        // Tapping inputNode triggers the system microphone permission prompt.
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+
+        // Create a fresh recognition request
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let recognitionRequest = recognitionRequest else {
+            throw NSError(domain: "VoiceRecognizer", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "无法创建语音识别请求"])
+        }
+        recognitionRequest.shouldReportPartialResults = true
+        // Disable automatic punctuation on macOS — Chinese output often
+        // inserts unwanted full-width punctuation mid-phrase.
+        if #available(macOS 15, *) {
+            // macOS 15 added taskHint; default (.unspecified) is fine.
+        }
+
+        recognitionTask = speechRecognizer.recognitionTask(
+            with: recognitionRequest
+        ) { [weak self] result, error in
+            guard let self = self else { return }
+            if let error = error {
+                DispatchQueue.main.async { self.onError?(error.localizedDescription) }
+                return
+            }
+            if let result = result {
+                let text = result.bestTranscription.formattedString
+                if result.isFinal {
+                    DispatchQueue.main.async { self.onFinalResult?(text) }
+                } else {
+                    DispatchQueue.main.async { self.onPartialResult?(text) }
+                }
+            }
+        }
+
+        // Feed audio buffers into the recognition request.
+        inputNode.installTap(onBus: 0, bufferSize: 1024,
+                             format: recordingFormat) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+
+        audioEngine.prepare()
+        try audioEngine.start()
+        onStateChange?(true)
+    }
+
+    func stopRecording() {
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        // Don't cancel the task — let it deliver final results.
+        onStateChange?(false)
+    }
+
+    /// Abort entirely (e.g. on permission error). Cancels task, tears down audio.
+    func cancel() {
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        if audioEngine.isRunning {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        recognitionRequest = nil
+        onStateChange?(false)
+    }
+
+    // MARK: SFSpeechRecognizerDelegate
+
+    func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer,
+                          availabilityDidChange available: Bool) {
+        if !available { onError?("语音识别服务暂不可用") }
+    }
+}
+
 // MARK: - Editor text view
 
 /// NSTextView that dismisses on Escape and inserts dropped files as (quoted)
@@ -902,6 +1031,14 @@ final class EditorTextView: NSTextView {
 final class EditorPanel: NSPanel {
     let textView = EditorTextView()
     private let sendButton = NSButton()
+    private let voiceRecognizer = VoiceRecognizer()
+    private var dictationMonitor: Any?
+    /// Range in the text view that holds the current partial dictation result,
+    /// so successive partials can replace it in-place.
+    private var dictationPendingRange: NSRange?
+    private var recordingDot: NSView!       // red pulsing dot
+    private var recordingLabel: NSTextField! // "录音中…"
+    private var hintLabel: NSTextField!      // idle hint text
 
     init() {
         super.init(
@@ -920,6 +1057,7 @@ final class EditorPanel: NSPanel {
         setFrameAutosaveName("ClaudeCommandBarEditorFrame")
 
         buildContent()
+        setupDictation()
     }
 
     override var canBecomeKey: Bool { true }
@@ -965,15 +1103,36 @@ final class EditorPanel: NSPanel {
         sendButton.keyEquivalentModifierMask = .command
         sendButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "⌘↵ 或点「发送」→ 选择终端 · 拖文件插路径 · ⌥⌥ 插 Finder 选中项")
-        hint.font = .systemFont(ofSize: 10)
-        hint.textColor = .tertiaryLabelColor
-        hint.lineBreakMode = .byTruncatingTail
-        hint.translatesAutoresizingMaskIntoConstraints = false
+        // Recording indicator: red dot + label, shown only while recording.
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        dot.layer?.cornerRadius = 4
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        recordingDot = dot
+
+        recordingLabel = NSTextField(labelWithString: "录音中…")
+        recordingLabel.font = .systemFont(ofSize: 10)
+        recordingLabel.textColor = .systemRed
+        recordingLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let recordStack = NSStackView(views: [dot, recordingLabel])
+        recordStack.orientation = .horizontal
+        recordStack.spacing = 4
+        recordStack.alignment = .centerY
+        recordStack.translatesAutoresizingMaskIntoConstraints = false
+        recordStack.isHidden = true
+
+        hintLabel = NSTextField(labelWithString: "⌘↵ 或点「发送」→ 选择终端 · 拖文件插路径 · ⌥⌥ 插 Finder 选中项")
+        hintLabel.font = .systemFont(ofSize: 10)
+        hintLabel.textColor = .tertiaryLabelColor
+        hintLabel.lineBreakMode = .byTruncatingTail
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let bar = NSView()
         bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(hint)
+        bar.addSubview(recordStack)
+        bar.addSubview(hintLabel)
         bar.addSubview(sendButton)
 
         container.addSubview(scroll)
@@ -989,13 +1148,19 @@ final class EditorPanel: NSPanel {
             bar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             bar.heightAnchor.constraint(equalToConstant: 38),
 
-            hint.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
-            hint.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
-            hint.trailingAnchor.constraint(
+            recordStack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+            recordStack.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+
+            hintLabel.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+            hintLabel.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            hintLabel.trailingAnchor.constraint(
                 lessThanOrEqualTo: sendButton.leadingAnchor, constant: -8),
 
             sendButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
             sendButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
         ])
 
         contentView = container
@@ -1030,6 +1195,169 @@ final class EditorPanel: NSPanel {
     func setText(_ s: String) {
         textView.string = s
         textView.setSelectedRange(NSRange(location: (s as NSString).length, length: 0))
+    }
+
+    // MARK: Dictation (push-to-talk)
+
+    private func setupDictation() {
+        voiceRecognizer.onPartialResult = { [weak self] text in
+            self?.applyDictationPartial(text)
+        }
+        voiceRecognizer.onFinalResult = { [weak self] text in
+            self?.applyDictationFinal(text)
+        }
+        voiceRecognizer.onError = { [weak self] msg in
+            self?.onDictationError(msg)
+        }
+        voiceRecognizer.onStateChange = { [weak self] recording in
+            self?.updateRecordingIndicator(recording)
+        }
+
+        // Local monitor: fires when PromptQy is the active app (editor focused).
+        // We watch both flagsChanged (for modifier keys like right Option) and
+        // keyDown/keyUp (for regular keys like F4/F5).  When a key is configured
+        // as a modifier we must use flagsChanged because modifiers don't send
+        // keyDown/keyUp to the responder chain.
+        let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .keyUp]
+        dictationMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) {
+            [weak self] event in
+            guard let self = self else { return event }
+            let target = Settings.dictationKeyCode
+
+            // Modifier keys only send flagsChanged — keyDown/keyUp never fire.
+            if event.type == .flagsChanged, event.keyCode == target,
+               self.isModifierKey(target) {
+                let pressed = event.modifierFlags.contains(self.flag(for: target))
+                if pressed { self.startDictation() }
+                else       { self.stopDictation() }
+                return event  // modifiers are non-consumable; let them flow
+            }
+
+            // Regular keys: keyDown starts, keyUp stops. Consume so the editor
+            // doesn't insert the character.
+            if event.type == .keyDown, event.keyCode == target,
+               !event.isARepeat, !self.isModifierKey(target) {
+                self.startDictation()
+                return nil  // swallow the key
+            }
+            if event.type == .keyUp, event.keyCode == target,
+               !self.isModifierKey(target) {
+                self.stopDictation()
+                return nil  // swallow the key
+            }
+
+            return event
+        }
+    }
+
+    /// Start recording. No-op if already recording.
+    private func startDictation() {
+        guard !voiceRecognizer.isRecording else { return }
+        dictationPendingRange = nil
+        do {
+            try voiceRecognizer.startRecording()
+        } catch {
+            voiceRecognizer.onError?(error.localizedDescription)
+        }
+    }
+
+    private func stopDictation() {
+        guard voiceRecognizer.isRecording else { return }
+        voiceRecognizer.stopRecording()
+    }
+
+    /// Insert (or replace) a partial transcription at the cursor.
+    private func applyDictationPartial(_ text: String) {
+        guard !text.isEmpty else { return }
+        let tv = textView
+        if let range = dictationPendingRange,
+           range.location + range.length <= (tv.string as NSString).length {
+            tv.replaceCharacters(in: range, with: text)
+        } else {
+            let cursor = tv.selectedRange().location
+            tv.insertText(text, replacementRange: tv.selectedRange())
+            dictationPendingRange = NSRange(location: cursor, length: 0)
+        }
+        dictationPendingRange = NSRange(
+            location: dictationPendingRange!.location,
+            length: (text as NSString).length)
+        // Keep cursor after the inserted text.
+        let end = dictationPendingRange!.location + dictationPendingRange!.length
+        tv.setSelectedRange(NSRange(location: end, length: 0))
+    }
+
+    /// Finalize the dictation — replace any pending partial with the final text.
+    private func applyDictationFinal(_ text: String) {
+        guard !text.isEmpty else { dictationPendingRange = nil; return }
+        if let range = dictationPendingRange,
+           range.location + range.length <= (textView.string as NSString).length {
+            textView.replaceCharacters(in: range, with: text)
+        } else {
+            textView.insertText(text, replacementRange: textView.selectedRange())
+        }
+        dictationPendingRange = nil
+    }
+
+    private func onDictationError(_ msg: String) {
+        dictationPendingRange = nil
+        voiceRecognizer.cancel()
+        // Don't show an alert for transient network errors — just let the user
+        // try again. Only surface hard failures (permission, no recognizer).
+        let hard = msg.contains("permission") || msg.contains("授权")
+            || msg.contains("not authorized") || msg.contains("不可用")
+        guard hard else { return }
+        let alert = NSAlert()
+        alert.messageText = "语音录入失败"
+        alert.informativeText = msg
+            + "\n\n请到「系统设置 → 隐私与安全性 → 语音识别」授权 PromptQy。"
+        alert.runModal()
+    }
+
+    /// Show/hide the recording indicator with a pulsing red dot.
+    private func updateRecordingIndicator(_ recording: Bool) {
+        guard let dot = recordingDot,
+              let hint = hintLabel,
+              let stack = dot.superview as? NSStackView else { return }
+        stack.isHidden = !recording
+        hint.isHidden = recording
+
+        if recording {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.15
+            pulse.duration = 0.6
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            dot.layer?.add(pulse, forKey: "pulse")
+        } else {
+            dot.layer?.removeAnimation(forKey: "pulse")
+        }
+    }
+
+    /// Whether the given key code belongs to a modifier key.
+    private func isModifierKey(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
+        case 54, 55,   // Command (left, right)
+             56, 60,   // Shift (left, right)
+             58, 61,   // Option (left, right)
+             59, 62,   // Control (left, right)
+             63:       // fn
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Map a modifier key code to its NSEvent.ModifierFlags value.
+    private func flag(for keyCode: UInt16) -> NSEvent.ModifierFlags {
+        switch keyCode {
+        case 54, 55: return .command
+        case 56, 60: return .shift
+        case 58, 61: return .option
+        case 59, 62: return .control
+        default:     return []
+        }
     }
 
     // MARK: Send flow
@@ -1370,6 +1698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         screenshotWatcher.start()
 
         ensureAccessibilityPermission()
+        ensureSpeechPermission()
     }
 
     /// (Re)create the double-tap monitors from the current settings.
@@ -1560,6 +1889,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             NSWorkspace.shared.open(URL(
                 string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        }
+    }
+
+    /// Request speech-recognition permission on first launch.
+    /// Microphone permission is prompted by the system on first use of
+    /// AVAudioEngine.inputNode, so we don't need to pre-request it.
+    private func ensureSpeechPermission() {
+        let status = VoiceRecognizer.permissionStatus
+        guard status == .notDetermined else { return }
+        VoiceRecognizer.requestPermission { granted in
+            if !granted {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "语音识别权限被拒绝"
+                    alert.informativeText =
+                        "语音录入功能需要「语音识别」权限。\n"
+                        + "请到「系统设置 → 隐私与安全性 → 语音识别」中开启「PromptQy」。"
+                    alert.addButton(withTitle: "打开隐私设置")
+                    alert.addButton(withTitle: "稍后")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.open(URL(
+                            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition")!)
+                    }
+                }
+            }
         }
     }
 }

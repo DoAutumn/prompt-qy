@@ -17,6 +17,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Double-tap Option** to insert the current Finder selection's paths
 - **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
+- **Voice dictation**: hold right Option to start recording (real-time streaming recognition), release to stop; a red pulsing dot + "录音中…" indicator appears in the bottom bar. Transcription appears live at the cursor and finalizes on release. Powered by macOS's native SFSpeechRecognizer — no external dependencies
 - **One-key send**: ⌘↵ → if several terminal windows/tabs exist, pick one by title → text is pasted into Claude and submitted; the editor clears
 - **Terminal.app & iTerm2**: send to either (or auto-detect); choose the target in Settings
 - **History** of sent messages in the menu; click to reload into the editor
@@ -29,6 +30,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 | Double-tap **Control** | Summon the editor; insert the selection if any |
 | Double-tap **Option** | Insert the current Finder selection's paths |
 | Double-tap **Command** | Open the current Finder selection in Sublime Text |
+| **Hold right Option** | Voice dictation (live transcription, release to stop); red pulsing dot indicator |
 | Drag a file into the editor | Insert its path |
 | ⌘⇧4 screenshot | Insert the new screenshot's path |
 | **⌘↵** | Send to the terminal (pick a window/tab if several) |
@@ -84,6 +86,8 @@ First use will prompt for (grant each once):
 
 - **Accessibility** — global key monitoring (double-tap summon), reading the selection, synthesizing keys
 - **Automation** — controlling Finder, Terminal.app and/or iTerm2 (enumerating windows/tabs, sending text)
+- **Speech Recognition** — macOS native SFSpeechRecognizer for real-time voice transcription
+- **Microphone** — only used while the dictation key is held
 - **Screenshot folder** — watching the system screenshot save directory (Desktop by default; changeable in Settings)
 
 If you hit "granted but still not working", it's usually a stale grant. Reindex the app and reset the service so it prompts again:
