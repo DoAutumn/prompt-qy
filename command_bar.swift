@@ -13,6 +13,8 @@
 //   4. Watch the screenshot folder and insert the path of new screenshots.
 //   5. Push-to-talk dictation: hold a key (default right Option) to stream
 //      speech recognition into the editor via SFSpeechRecognizer.
+//   6. Quick phrases: preset text snippets in the menu bar, one-click insert
+//      with ⌃1–⌃9 keyboard shortcuts; editable in Settings.
 //
 // Build via ./build_app.sh.
 
@@ -89,6 +91,24 @@ enum Settings {
     static var dictationKeyCode: UInt16 {
         get { let v = d.integer(forKey: "dictationKeyCode"); return v != 0 ? UInt16(v) : 0x3D }
         set { d.set(Int(newValue), forKey: "dictationKeyCode") }
+    }
+    /// Quick phrases shown in the menu bar for one-click insertion.
+    /// Stored as a newline-separated string in UserDefaults so it's easy to edit
+    /// in the settings panel with a plain text view.
+    static var quickPhrases: [String] {
+        get {
+            let raw = d.string(forKey: "quickPhrases") ?? ""
+            let lines = raw.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !lines.isEmpty { return lines }
+            return [
+                "如果有任何疑问先向我提问",
+                "请用中文回答",
+                "不要过度设计，保持简洁",
+            ]
+        }
+        set { d.set(newValue.joined(separator: "\n"), forKey: "quickPhrases") }
     }
 }
 
@@ -1500,6 +1520,7 @@ final class SettingsWindowController: NSObject {
     private let widthPopup = NSPopUpButton()
     private let pathLabel = NSTextField(labelWithString: "")
     private let choosePathButton = NSButton(title: "选择…", target: nil, action: nil)
+    private var phrasesTextView: NSTextView!
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
@@ -1550,6 +1571,25 @@ final class SettingsWindowController: NSObject {
         pathRow.alignment = .centerY
         pathRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
 
+        // Phrases editor: a small scrollable text view, one phrase per line.
+        let phrasesScroll = NSScrollView()
+        phrasesTextView = NSTextView()
+        phrasesTextView.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        phrasesTextView.isRichText = false
+        phrasesTextView.isAutomaticQuoteSubstitutionEnabled = false
+        phrasesTextView.isAutomaticDashSubstitutionEnabled = false
+        phrasesTextView.allowsUndo = true
+        phrasesTextView.textContainerInset = NSSize(width: 4, height: 4)
+        phrasesScroll.documentView = phrasesTextView
+        phrasesScroll.hasVerticalScroller = true
+        phrasesScroll.hasHorizontalScroller = false
+        phrasesScroll.borderType = .bezelBorder
+        phrasesScroll.heightAnchor.constraint(equalToConstant: 60).isActive = true
+        phrasesScroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(phrasesChanged),
+            name: NSText.didChangeNotification, object: phrasesTextView)
+
         func row(_ label: String, _ control: NSView) -> [NSView] {
             let l = NSTextField(labelWithString: label)
             l.alignment = .right
@@ -1563,6 +1603,7 @@ final class SettingsWindowController: NSObject {
             row("历史保留条数：", historyPopup),
             row("菜单标题最大字数：", widthPopup),
             row("⌘⇧4 截图保存路径：", pathRow),
+            row("常用语（每行一条）：", phrasesScroll),
         ])
         grid.rowSpacing = 12
         grid.columnSpacing = 10
@@ -1633,6 +1674,7 @@ final class SettingsWindowController: NSObject {
             .flatMap { TerminalApp.allCases.firstIndex(of: $0) }.map { $0 + 1 } ?? 0)
         pathLabel.stringValue = ScreenshotLocation.displayPath
         pathLabel.toolTip = ScreenshotLocation.url.path
+        phrasesTextView.string = Settings.quickPhrases.joined(separator: "\n")
     }
 
     @objc private func changed() {
@@ -1644,6 +1686,13 @@ final class SettingsWindowController: NSObject {
         let i = terminalPopup.indexOfSelectedItem
         Settings.terminalApp = i > 0 ? TerminalApp.allCases[i - 1] : nil
         onChange()
+    }
+
+    @objc private func phrasesChanged() {
+        let lines = phrasesTextView.string.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        Settings.quickPhrases = lines
     }
 
     @objc private func chooseScreenshotPath() {
@@ -1677,6 +1726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var summonMonitor: DoubleTapMonitor?
     private var finderMonitor: DoubleTapMonitor?
     private var openMonitor: DoubleTapMonitor?
+    private var phrasesKeyMonitors: [Any] = []
     private var screenshotWatcher: ScreenshotWatcher!
     private lazy var settingsController = SettingsWindowController { [weak self] in
         self?.restartMonitors()
@@ -1688,6 +1738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         setupMainMenu()
         setupStatusItem()
+        setupPhrasesShortcuts()
         restartMonitors()
 
         screenshotWatcher = ScreenshotWatcher { [weak self] url in
@@ -1721,6 +1772,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyCodes: open.keyCodes, flag: open.flag,
             interval: Settings.doubleTapInterval) { [weak self] in self?.onOpenInEditor() }
         openMonitor?.start()
+    }
+
+    /// Global ⌘1–⌘9 shortcuts for quick phrases. A global monitor can only
+    /// observe (not consume) events, so the frontmost app also receives the
+    /// key press — ⌘1 still switches to the first tab in a browser, for example.
+    private func setupPhrasesShortcuts() {
+        // Main-keyboard digit key codes for 1–9.
+        let digitKeyCodes: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25]
+        let globalHandler: (NSEvent) -> Void = { [weak self] event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .control,
+                  let idx = digitKeyCodes.firstIndex(of: event.keyCode),
+                  !event.isARepeat else { return }
+            self?.pickPhraseByIndex(idx)
+        }
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: globalHandler) {
+            phrasesKeyMonitors.append(g)
+        }
+        // Local monitor: consume the event when PromptQy is active so the text
+        // view doesn't receive a stray character.
+        let localHandler: (NSEvent) -> NSEvent? = { [weak self] event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .control,
+                  let idx = digitKeyCodes.firstIndex(of: event.keyCode),
+                  !event.isARepeat else { return event }
+            self?.pickPhraseByIndex(idx)
+            return nil
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: localHandler) {
+            phrasesKeyMonitors.append(l)
+        }
+    }
+
+    private func pickPhraseByIndex(_ idx: Int) {
+        let phrases = Settings.quickPhrases
+        guard idx < phrases.count else { return }
+        panel.showAndFocus()
+        panel.insertAtCursor(phrases[idx] + "\n")
     }
 
     /// An accessory (LSUIElement) app has no menu bar, but a main menu is still
@@ -1786,6 +1875,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         open.target = self
         menu.addItem(.separator())
 
+        let phrases = Settings.quickPhrases
+        if !phrases.isEmpty {
+            let phraseHeader = menu.addItem(withTitle: "常用语（点击插入）", action: nil, keyEquivalent: "")
+            phraseHeader.isEnabled = false
+            for (i, phrase) in phrases.enumerated() {
+                let title = phrase.count > 50 ? String(phrase.prefix(47)) + "…" : phrase
+                let key = i < 9 ? "\(i + 1)" : ""
+                let item = menu.addItem(
+                    withTitle: title,
+                    action: #selector(pickPhrase(_:)), keyEquivalent: key)
+                item.keyEquivalentModifierMask = i < 9 ? .control : []
+                item.target = self
+                item.tag = i
+            }
+            menu.addItem(.separator())
+        }
+
         let history = HistoryStore.items
         if history.isEmpty {
             let empty = menu.addItem(withTitle: "（暂无历史）", action: nil, keyEquivalent: "")
@@ -1818,6 +1924,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showEditor() { panel.showAndFocus() }
+
+    @objc private func pickPhrase(_ sender: NSMenuItem) {
+        let phrases = Settings.quickPhrases
+        guard sender.tag >= 0, sender.tag < phrases.count else { return }
+        panel.showAndFocus()
+        panel.insertAtCursor(phrases[sender.tag] + "\n")
+    }
 
     @objc private func pickHistory(_ sender: NSMenuItem) {
         let items = HistoryStore.items
