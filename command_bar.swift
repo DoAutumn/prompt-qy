@@ -6,8 +6,8 @@
 //   1. Menu-bar item + always-on-top draggable/resizable editor + double-tap
 //      Control to summon/dismiss.
 //   2. Grab the frontmost app's selection on summon (AX, then synthesized
-//      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app
-//      or iTerm2 tab.
+//      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app,
+//      iTerm2, or Otty tab.
 //   3. Drag files onto the editor to insert their paths + a double-tap Option
 //      hotkey to insert the Finder selection.
 //   4. Watch the screenshot folder and insert the path of new screenshots.
@@ -306,11 +306,13 @@ enum ExternalEditor {
 enum TerminalApp: String, CaseIterable {
     case terminal
     case iterm
+    case otty
 
     var bundleId: String {
         switch self {
         case .terminal: return "com.apple.Terminal"
         case .iterm: return "com.googlecode.iterm2"
+        case .otty: return "io.appmakes.otty"
         }
     }
 
@@ -318,6 +320,7 @@ enum TerminalApp: String, CaseIterable {
         switch self {
         case .terminal: return "终端.app"
         case .iterm: return "iTerm2"
+        case .otty: return "Otty"
         }
     }
 
@@ -385,7 +388,7 @@ enum TerminalSender {
         // so a stray tab in it can't shift the other fields.
         let body: String
         switch app {
-        case .terminal:
+        case .terminal, .otty:
             body = """
                     set winName to ""
                     try
@@ -545,6 +548,12 @@ enum TerminalSender {
             focus = """
             set selected of tab \(target.tabIndex) of targetWin to true
             set frontmost of targetWin to true
+            """
+        case .otty:
+            // Otty's AppleScript matches Terminal.app but rejects
+            // `frontmost of window`; activate (below in send()) raises it.
+            focus = """
+            set selected of tab \(target.tabIndex) of targetWin to true
             """
         case .iterm:
             focus = """

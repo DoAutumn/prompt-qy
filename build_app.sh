@@ -45,7 +45,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
     <key>CFBundleIconName</key>        <string>AppIcon</string>
     <key>LSUIElement</key>             <true/>
-    <key>NSAppleEventsUsageDescription</key> <string>控制 Finder 与终端（终端.app / iTerm2），以插入文件路径、把内容发送到终端并执行。</string>
+    <key>NSAppleEventsUsageDescription</key> <string>控制 Finder 与终端（终端.app / iTerm2 / Otty），以插入文件路径、把内容发送到终端并执行。</string>
     <key>NSSpeechRecognitionUsageDescription</key> <string>语音识别用于将口述内容实时转写并录入编辑器。</string>
     <key>NSMicrophoneUsageDescription</key> <string>麦克风仅在按住语音键录音时使用，用于将口述内容转写为文字。</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
