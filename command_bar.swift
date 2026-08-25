@@ -1152,7 +1152,7 @@ final class EditorPanel: NSPanel {
         recordStack.translatesAutoresizingMaskIntoConstraints = false
         recordStack.isHidden = true
 
-        hintLabel = NSTextField(labelWithString: "⌘↵ 或点「发送」→ 选择终端 · 拖文件插路径 · ⌥⌥ 插 Finder 选中项")
+        hintLabel = NSTextField(labelWithString: "⌘↵ 发送 · 拖文件插路径 · ⌥⌥ 插 Finder · 按住右 ⌥ 语音录入")
         hintLabel.font = .systemFont(ofSize: 10)
         hintLabel.textColor = .tertiaryLabelColor
         hintLabel.lineBreakMode = .byTruncatingTail
