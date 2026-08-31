@@ -8,13 +8,15 @@
 //   2. Grab the frontmost app's selection on summon (AX, then synthesized
 //      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app,
 //      iTerm2, or Otty tab.
-//   3. Drag files onto the editor to insert their paths + a double-tap Option
-//      hotkey to insert the Finder selection.
+//   3. Drag files onto the editor to insert their paths.
 //   4. Watch the screenshot folder and insert the path of new screenshots.
 //   5. Push-to-talk dictation: hold a key (default right Option) to stream
 //      speech recognition into the editor via SFSpeechRecognizer.
 //   6. Quick phrases: preset text snippets in the menu bar, one-click insert
 //      with ⌃1–⌃9 keyboard shortcuts; editable in Settings.
+//   7. Double-tap Option to search Obsidian/.md notes: floating Spotlight-like
+//      panel with Markdown preview (select/copy, jump to first match); vault
+//      path + exclude dirs configurable in Settings.
 //
 // Build via ./build_app.sh.
 
@@ -22,6 +24,7 @@ import Cocoa
 import ApplicationServices
 import Speech
 import AVFoundation
+import WebKit
 
 // MARK: - Settings
 
@@ -66,13 +69,35 @@ enum Settings {
         get { ModifierChoice(rawValue: d.string(forKey: "summonModifier") ?? "") ?? .control }
         set { d.set(newValue.rawValue, forKey: "summonModifier") }
     }
-    static var finderModifier: ModifierChoice {
-        get { ModifierChoice(rawValue: d.string(forKey: "finderModifier") ?? "") ?? .option }
-        set { d.set(newValue.rawValue, forKey: "finderModifier") }
+    static var searchModifier: ModifierChoice {
+        get { ModifierChoice(rawValue: d.string(forKey: "searchModifier") ?? "") ?? .option }
+        set { d.set(newValue.rawValue, forKey: "searchModifier") }
     }
     static var openModifier: ModifierChoice {
         get { ModifierChoice(rawValue: d.string(forKey: "openModifier") ?? "") ?? .command }
         set { d.set(newValue.rawValue, forKey: "openModifier") }
+    }
+    /// Root folder of the Markdown notes vault (e.g. Obsidian iCloud path).
+    static var notesVaultPath: String {
+        get {
+            if let s = d.string(forKey: "notesVaultPath"), !s.isEmpty { return s }
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "Library/Mobile Documents/iCloud~md~obsidian/Documents").path
+        }
+        set { d.set(newValue, forKey: "notesVaultPath") }
+    }
+    /// Relative directory names/paths to skip while indexing notes.
+    static var notesExcludeDirs: [String] {
+        get {
+            guard let raw = d.string(forKey: "notesExcludeDirs") else {
+                return [".obsidian", ".trash"]
+            }
+            return raw.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+        }
+        set { d.set(newValue.joined(separator: "\n"), forKey: "notesExcludeDirs") }
     }
     static var historyLimit: Int {
         get { let v = d.integer(forKey: "historyLimit"); return v > 0 ? v : 50 }
@@ -1152,7 +1177,7 @@ final class EditorPanel: NSPanel {
         recordStack.translatesAutoresizingMaskIntoConstraints = false
         recordStack.isHidden = true
 
-        hintLabel = NSTextField(labelWithString: "⌘↵ 发送 · 拖文件插路径 · ⌥⌥ 插 Finder · 按住右 ⌥ 语音录入")
+        hintLabel = NSTextField(labelWithString: "⌘↵ 发送 · 拖文件插路径 · 按住右 ⌥ 语音录入")
         hintLabel.font = .systemFont(ofSize: 10)
         hintLabel.textColor = .tertiaryLabelColor
         hintLabel.lineBreakMode = .byTruncatingTail
@@ -1507,6 +1532,912 @@ final class EditorPanel: NSPanel {
     }
 }
 
+// MARK: - Markdown notes search
+
+/// One hit from the vault. `rank` 0 = filename match (preferred), 1 = body only.
+struct NoteHit {
+    let url: URL
+    let relativePath: String
+    let title: String
+    let rank: Int
+    let snippet: String
+    let body: String
+    /// First body match as it appears in `body` (for preview jump); nil if none.
+    let matchText: String?
+}
+
+/// Scans a Markdown vault (Obsidian etc.) for `.md` files. Fine for ~hundreds
+/// of notes — no persistent index.
+enum MarkdownVault {
+    static func search(query: String) -> [NoteHit] {
+        let root = URL(fileURLWithPath: Settings.notesVaultPath, isDirectory: true)
+        let excludes = Settings.notesExcludeDirs
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let qLower = q.lowercased()
+
+        guard FileManager.default.fileExists(atPath: root.path) else { return [] }
+
+        var hits: [NoteHit] = []
+        let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles])
+        while let url = enumerator?.nextObject() as? URL {
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            if isDir.boolValue {
+                let name = url.lastPathComponent
+                if shouldExclude(name: name, relative: relativePath(url, root: root), excludes: excludes) {
+                    enumerator?.skipDescendants()
+                }
+                continue
+            }
+            // iCloud placeholder: "Note.md.icloud"
+            if url.pathExtension.lowercased() == "icloud" { continue }
+            guard url.pathExtension.lowercased() == "md" else { continue }
+
+            let rel = relativePath(url, root: root)
+            if shouldExclude(name: url.lastPathComponent, relative: rel, excludes: excludes) {
+                continue
+            }
+
+            let title = url.deletingPathExtension().lastPathComponent
+            let body = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let matchText = firstMatch(in: body, matching: qLower)
+
+            if q.isEmpty {
+                hits.append(NoteHit(
+                    url: url, relativePath: rel, title: title,
+                    rank: 0, snippet: firstLine(body), body: body, matchText: nil))
+                continue
+            }
+
+            let nameHit = title.lowercased().contains(qLower)
+                || rel.lowercased().contains(qLower)
+            let bodyHit = matchText != nil
+            guard nameHit || bodyHit else { continue }
+            hits.append(NoteHit(
+                url: url, relativePath: rel, title: title,
+                rank: nameHit ? 0 : 1,
+                snippet: nameHit && matchText == nil
+                    ? firstLine(body)
+                    : (matchText.map { snippet(in: body, matching: $0.lowercased()) } ?? firstLine(body)),
+                body: body,
+                matchText: matchText))
+        }
+
+        return hits.sorted {
+            if $0.rank != $1.rank { return $0.rank < $1.rank }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    private static func relativePath(_ url: URL, root: URL) -> String {
+        let full = url.standardizedFileURL.path
+        let prefix = root.standardizedFileURL.path
+        if full.hasPrefix(prefix) {
+            let drop = prefix.count + (prefix.hasSuffix("/") ? 0 : 1)
+            return String(full.dropFirst(drop))
+        }
+        return url.lastPathComponent
+    }
+
+    private static func shouldExclude(name: String, relative: String, excludes: [String]) -> Bool {
+        let parts = relative.split(separator: "/").map(String.init)
+        for raw in excludes {
+            let ex = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            guard !ex.isEmpty else { continue }
+            if name == ex { return true }
+            if parts.contains(ex) { return true }
+            if relative == ex || relative.hasPrefix(ex + "/") { return true }
+        }
+        return false
+    }
+
+    private static func firstLine(_ body: String) -> String {
+        let line = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.count > 80 ? String(trimmed.prefix(77)) + "…" : trimmed
+    }
+
+    private static func firstMatch(in body: String, matching needle: String) -> String? {
+        guard !needle.isEmpty else { return nil }
+        let lower = body.lowercased()
+        guard let range = lower.range(of: needle) else { return nil }
+        return String(body[range])
+    }
+
+    private static func snippet(in body: String, matching needle: String) -> String {
+        let lower = body.lowercased()
+        guard let range = lower.range(of: needle) else { return firstLine(body) }
+        let lineStart = body[..<range.lowerBound].lastIndex(where: { $0.isNewline })
+            .map { body.index(after: $0) } ?? body.startIndex
+        let lineEnd = body[range.upperBound...].firstIndex(where: { $0.isNewline }) ?? body.endIndex
+        let line = String(body[lineStart..<lineEnd]).trimmingCharacters(in: .whitespaces)
+        return line.count > 100 ? String(line.prefix(97)) + "…" : line
+    }
+}
+
+/// Lightweight Markdown → HTML for the notes preview. Covers the Obsidian basics
+/// (headings, emphasis, code, lists, links, wikilinks) and passes through raw
+/// HTML blocks (Obsidian often stores tables as `<table>…</table>`).
+enum MarkdownHTML {
+    static func render(_ markdown: String) -> String {
+        var text = markdown.replacingOccurrences(of: "\r\n", with: "\n")
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Whole-note HTML (e.g. Obsidian HTML tables) — don't escape tags.
+        if trimmed.hasPrefix("<") {
+            return stripScripts(text)
+        }
+
+        var fences: [String] = []
+        text = replaceFences(in: text, store: &fences)
+
+        var html: [String] = []
+        var listKind: String? = nil  // "ul" | "ol"
+        var para: [String] = []
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var i = 0
+
+        func flushPara() {
+            guard !para.isEmpty else { return }
+            // Obsidian-style hard breaks. Inline each line first — joining with
+            // "<br>" before escape() would turn the tag into literal text.
+            let body = para.map { inline($0) }.joined(separator: "<br>")
+            html.append("<p>" + body + "</p>")
+            para.removeAll()
+        }
+        func flushList() {
+            if let k = listKind {
+                html.append("</\(k)>")
+                listKind = nil
+            }
+        }
+
+        while i < lines.count {
+            let line = lines[i]
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmedLine.isEmpty {
+                flushPara()
+                flushList()
+                i += 1
+                continue
+            }
+
+            // Raw HTML block (table / div / …) — Obsidian embeds these as-is.
+            if let tag = htmlBlockTag(trimmedLine) {
+                flushPara()
+                flushList()
+                var block = [line]
+                let close = "</\(tag)>"
+                if !trimmedLine.lowercased().contains(close) && !isVoidHTMLTag(tag) {
+                    i += 1
+                    while i < lines.count {
+                        block.append(lines[i])
+                        if lines[i].lowercased().contains(close) { break }
+                        i += 1
+                    }
+                }
+                html.append(stripScripts(block.joined(separator: "\n")))
+                i += 1
+                continue
+            }
+
+            if let fenceIdx = fencePlaceholderIndex(trimmedLine) {
+                flushPara()
+                flushList()
+                html.append("<pre><code>\(fences[fenceIdx])</code></pre>")
+                i += 1
+                continue
+            }
+
+            if let heading = heading(trimmedLine) {
+                flushPara()
+                flushList()
+                html.append(heading)
+                i += 1
+                continue
+            }
+
+            if let m = trimmedLine.range(of: #"^[-*+]\s+"#, options: .regularExpression) {
+                flushPara()
+                if listKind != "ul" {
+                    flushList()
+                    html.append("<ul>")
+                    listKind = "ul"
+                }
+                let item = String(trimmedLine[m.upperBound...])
+                html.append("<li>\(inline(item))</li>")
+                i += 1
+                continue
+            }
+            if let m = trimmedLine.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
+                flushPara()
+                if listKind != "ol" {
+                    flushList()
+                    html.append("<ol>")
+                    listKind = "ol"
+                }
+                let item = String(trimmedLine[m.upperBound...])
+                html.append("<li>\(inline(item))</li>")
+                i += 1
+                continue
+            }
+            if trimmedLine.hasPrefix("> ") || trimmedLine == ">" {
+                flushPara()
+                flushList()
+                let quote = trimmedLine.hasPrefix("> ") ? String(trimmedLine.dropFirst(2)) : ""
+                html.append("<blockquote><p>\(inline(quote))</p></blockquote>")
+                i += 1
+                continue
+            }
+            if trimmedLine.hasPrefix("---") && trimmedLine.allSatisfy({ $0 == "-" || $0 == " " }) {
+                flushPara()
+                flushList()
+                html.append("<hr>")
+                i += 1
+                continue
+            }
+
+            flushList()
+            para.append(trimmedLine)
+            i += 1
+        }
+        flushPara()
+        flushList()
+        return html.joined(separator: "\n")
+    }
+
+    /// Count non-overlapping case-insensitive occurrences of `query` in `body`.
+    /// For HTML notes, tags are stripped so the count matches visible text.
+    static func matchCount(in body: String, query: String) -> Int {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return 0 }
+        let haystack: String
+        if body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
+            haystack = body.replacingOccurrences(
+                of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+        } else {
+            haystack = body
+        }
+        let lower = haystack.lowercased()
+        let n = needle.lowercased()
+        var count = 0
+        var start = lower.startIndex
+        while let r = lower.range(of: n, range: start..<lower.endIndex) {
+            count += 1
+            start = r.upperBound
+        }
+        return count
+    }
+
+    private static func htmlBlockTag(_ line: String) -> String? {
+        // Match opening tags Obsidian commonly embeds as whole blocks.
+        let pattern = #"^<(table|div|section|article|details|aside|figure|blockquote|ul|ol|pre|iframe|p)\b"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let m = re.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)),
+              m.numberOfRanges > 1 else { return nil }
+        return (line as NSString).substring(with: m.range(at: 1)).lowercased()
+    }
+
+    private static func isVoidHTMLTag(_ tag: String) -> Bool {
+        ["br", "hr", "img", "input", "meta", "link"].contains(tag)
+    }
+
+    private static func stripScripts(_ html: String) -> String {
+        guard let re = try? NSRegularExpression(
+            pattern: #"<script\b[^>]*>[\s\S]*?</script>"#,
+            options: [.caseInsensitive]) else { return html }
+        let ns = html as NSString
+        return re.stringByReplacingMatches(
+            in: html, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+    }
+
+    private static func replaceFences(in text: String, store: inout [String]) -> String {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var out: [String] = []
+        var i = 0
+        while i < lines.count {
+            if lines[i].hasPrefix("```") {
+                var code: [String] = []
+                i += 1
+                while i < lines.count && !lines[i].hasPrefix("```") {
+                    code.append(lines[i])
+                    i += 1
+                }
+                store.append(escape(code.joined(separator: "\n")))
+                out.append("%%FENCE\(store.count - 1)%%")
+                if i < lines.count { i += 1 }
+                continue
+            }
+            out.append(lines[i])
+            i += 1
+        }
+        return out.joined(separator: "\n")
+    }
+
+    private static func fencePlaceholderIndex(_ line: String) -> Int? {
+        guard line.hasPrefix("%%FENCE"), line.hasSuffix("%%") else { return nil }
+        let inner = line.dropFirst(7).dropLast(2)
+        return Int(inner)
+    }
+
+    private static func heading(_ line: String) -> String? {
+        var n = 0
+        for ch in line {
+            if ch == "#" { n += 1 } else { break }
+        }
+        guard (1...6).contains(n) else { return nil }
+        let rest = line.dropFirst(n)
+        guard rest.first == " " || rest.isEmpty else { return nil }
+        let title = rest.drop(while: { $0 == " " })
+        return "<h\(n)>\(inline(String(title)))</h\(n)>"
+    }
+
+    private static func inline(_ s: String) -> String {
+        var t = escape(s)
+        // Wikilinks [[note]] / [[note|label]]
+        t = replace(t, pattern: #"\[\[([^\]|]+)\|([^\]]+)\]\]"#) { "<span class=\"wiki\">\($0[2])</span>" }
+        t = replace(t, pattern: #"\[\[([^\]]+)\]\]"#) { "<span class=\"wiki\">\($0[1])</span>" }
+        // Links [text](url)
+        t = replace(t, pattern: #"\[([^\]]+)\]\(([^)]+)\)"#) {
+            "<a href=\"\($0[2])\">\($0[1])</a>"
+        }
+        // Inline code
+        t = replace(t, pattern: #"`([^`]+)`"#) { "<code>\($0[1])</code>" }
+        // Strikethrough ~~ ~~
+        t = replace(t, pattern: #"~~([^~]+)~~"#) { "<del>\($0[1])</del>" }
+        // Bold ** ** / __ __
+        t = replace(t, pattern: #"\*\*([^*]+)\*\*"#) { "<strong>\($0[1])</strong>" }
+        t = replace(t, pattern: #"__([^_]+)__"#) { "<strong>\($0[1])</strong>" }
+        // Italic: only when * / _ are flanked by word boundaries — avoid
+        // mangling shell globs (`du -sh *`) and identifiers (`current_user`).
+        t = replace(t, pattern: #"(?<!\w)\*([^*]+)\*(?!\w)"#) { "<em>\($0[1])</em>" }
+        t = replace(t, pattern: #"(?<!\w)_([^_]+)_(?!\w)"#) { "<em>\($0[1])</em>" }
+        return t
+    }
+
+    private static func replace(
+        _ input: String,
+        pattern: String,
+        _ build: ([String]) -> String
+    ) -> String {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return input }
+        let ns = input as NSString
+        let matches = re.matches(in: input, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return input }
+        var out = ""
+        var cursor = 0
+        for m in matches {
+            let full = m.range
+            out += ns.substring(with: NSRange(location: cursor, length: full.location - cursor))
+            var groups = [ns.substring(with: full)]
+            for i in 1..<m.numberOfRanges {
+                let r = m.range(at: i)
+                groups.append(r.location == NSNotFound ? "" : ns.substring(with: r))
+            }
+            out += build(groups)
+            cursor = full.location + full.length
+        }
+        out += ns.substring(from: cursor)
+        return out
+    }
+
+    private static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+}
+
+// MARK: - Notes search panel (Spotlight-like)
+
+/// Search field that forwards ↑/↓ to the results list.
+private final class NotesSearchField: NSSearchField {
+    var onMoveUp: (() -> Void)?
+    var onMoveDown: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 126: onMoveUp?()
+        case 125: onMoveDown?()
+        default: super.keyDown(with: event)
+        }
+    }
+}
+
+/// Always-on-top notes browser: query → list → Markdown preview (select/copy),
+/// jumping to the first body match when present.
+final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate {
+    private let searchField = NotesSearchField()
+    private let tableView = NSTableView()
+    private let previewWeb: WKWebView = {
+        let w = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        return w
+    }()
+    private let matchCountLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(labelWithString: "")
+    private var splitView: NSSplitView!
+    private var hits: [NoteHit] = []
+    private var searchWork: DispatchWorkItem?
+    private var searchGeneration = 0
+    private var pendingJump: String?
+    private var loadToken = 0
+    private var currentQuery = ""
+    private var didApplyInitialSplit = false
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 440),
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+
+        title = "搜索笔记"
+        isFloatingPanel = true
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        minSize = NSSize(width: 520, height: 320)
+        setFrameAutosaveName("PromptQyNotesSearchFrame")
+        buildContent()
+    }
+
+    override var canBecomeKey: Bool { true }
+    override func cancelOperation(_ sender: Any?) { orderOut(nil) }
+    override func close() { orderOut(nil) }
+
+    func showAndFocus() {
+        if !isVisible { center() }
+        searchField.stringValue = ""
+        runSearch("")
+        makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        makeFirstResponder(searchField)
+        applyInitialSplitIfNeeded()
+    }
+
+    private func applyInitialSplitIfNeeded() {
+        guard !didApplyInitialSplit, let split = splitView else { return }
+        contentView?.layoutSubtreeIfNeeded()
+        let total = split.bounds.width
+        guard total > 0 else {
+            // Frame may not be ready on first call — retry once next turn.
+            DispatchQueue.main.async { [weak self] in self?.applyInitialSplitIfNeeded() }
+            return
+        }
+        // Prefer a restored autosave divider when present; only seed once if
+        // both panes look collapsed/uninitialized.
+        let left = split.subviews.first?.frame.width ?? 0
+        if left < 80 || left > total - 80 {
+            split.setPosition(min(280, max(200, total * 0.32)), ofDividerAt: 0)
+        }
+        didApplyInitialSplit = true
+    }
+
+    private func buildContent() {
+        searchField.placeholderString = "搜索文件名或正文…"
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        searchField.delegate = self
+        searchField.onMoveUp = { [weak self] in self?.moveSelection(by: -1) }
+        searchField.onMoveDown = { [weak self] in self?.moveSelection(by: 1) }
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("note"))
+        col.title = "笔记"
+        col.width = 220
+        col.minWidth = 120
+        col.maxWidth = 10_000
+        tableView.addTableColumn(col)
+        tableView.headerView = nil
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.allowsEmptySelection = false
+        tableView.allowsMultipleSelection = false
+        tableView.rowHeight = 52
+        tableView.intercellSpacing = NSSize(width: 0, height: 6)
+        tableView.target = self
+        tableView.action = #selector(tableClicked)
+        tableView.style = .plain
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.selectionHighlightStyle = .regular
+
+        let listScroll = NSScrollView()
+        listScroll.documentView = tableView
+        listScroll.hasVerticalScroller = true
+        listScroll.borderType = .noBorder
+        listScroll.drawsBackground = false
+        // Split-view children must use frame-based layout (autoresizingMask).
+        // Auto Layout width constraints on them fight the divider and snap back.
+        listScroll.translatesAutoresizingMaskIntoConstraints = true
+        listScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        listScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        previewWeb.navigationDelegate = self
+        previewWeb.translatesAutoresizingMaskIntoConstraints = false
+        // Wide HTML tables report a huge intrinsic width; don't let that drive the split.
+        previewWeb.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+        previewWeb.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
+        previewWeb.setContentHuggingPriority(.defaultLow, for: .vertical)
+        previewWeb.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        matchCountLabel.font = .systemFont(ofSize: 11)
+        matchCountLabel.textColor = .secondaryLabelColor
+        matchCountLabel.alignment = .left
+        matchCountLabel.lineBreakMode = .byTruncatingTail
+        matchCountLabel.translatesAutoresizingMaskIntoConstraints = false
+        matchCountLabel.stringValue = ""
+        matchCountLabel.setContentHuggingPriority(.required, for: .vertical)
+
+        let previewPane = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        previewPane.translatesAutoresizingMaskIntoConstraints = true
+        previewPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        previewPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        previewPane.addSubview(previewWeb)
+        previewPane.addSubview(matchCountLabel)
+        NSLayoutConstraint.activate([
+            previewWeb.topAnchor.constraint(equalTo: previewPane.topAnchor),
+            previewWeb.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor),
+            previewWeb.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor),
+            previewWeb.bottomAnchor.constraint(equalTo: matchCountLabel.topAnchor, constant: -4),
+
+            matchCountLabel.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor, constant: 10),
+            matchCountLabel.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor, constant: -10),
+            matchCountLabel.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor, constant: -6),
+            matchCountLabel.heightAnchor.constraint(equalToConstant: 16),
+        ])
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.delegate = self
+        split.autosaveName = "PromptQyNotesSplit"
+        split.addSubview(listScroll)
+        split.addSubview(previewPane)
+        // List holds its width when the window resizes; preview absorbs the slack.
+        split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        split.setHoldingPriority(NSLayoutConstraint.Priority(240), forSubviewAt: 1)
+        split.translatesAutoresizingMaskIntoConstraints = false
+        splitView = split
+
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(searchField)
+        root.addSubview(split)
+        root.addSubview(statusLabel)
+        contentView = root
+
+        NSLayoutConstraint.activate([
+            searchField.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            searchField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+
+            split.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            split.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            split.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
+
+            statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            statusLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+        ])
+    }
+
+    // MARK: NSSplitViewDelegate
+
+    func splitView(_ splitView: NSSplitView,
+                   constrainMinCoordinate proposedMinimumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        160  // min list width
+    }
+
+    func splitView(_ splitView: NSSplitView,
+                   constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        splitView.bounds.width - 220  // min preview width
+    }
+
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        false
+    }
+
+    // MARK: Search
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard obj.object as AnyObject === searchField else { return }
+        let q = searchField.stringValue
+        searchWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.runSearch(q) }
+        searchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.moveUp(_:)) {
+            moveSelection(by: -1); return true
+        }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            moveSelection(by: 1); return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            orderOut(nil); return true
+        }
+        return false
+    }
+
+    private func runSearch(_ query: String) {
+        searchGeneration += 1
+        let gen = searchGeneration
+        currentQuery = query
+        let vault = Settings.notesVaultPath
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let results = MarkdownVault.search(query: query)
+            DispatchQueue.main.async {
+                guard let self = self, gen == self.searchGeneration else { return }
+                self.hits = results
+                self.tableView.reloadData()
+                if results.isEmpty {
+                    self.clearPreview()
+                    let exists = FileManager.default.fileExists(atPath: vault)
+                    self.statusLabel.stringValue = exists
+                        ? "无匹配结果"
+                        : "笔记库路径不存在：\(vault)"
+                } else {
+                    self.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+                    self.showPreview(for: 0)
+                    self.statusLabel.stringValue = "\(results.count) 条 · Esc 关闭 · 预览中可框选复制"
+                }
+            }
+        }
+    }
+
+    private func moveSelection(by delta: Int) {
+        guard !hits.isEmpty else { return }
+        let current = tableView.selectedRow >= 0 ? tableView.selectedRow : 0
+        let next = max(0, min(hits.count - 1, current + delta))
+        tableView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+        tableView.scrollRowToVisible(next)
+        showPreview(for: next)
+    }
+
+    @objc private func tableClicked() {
+        let row = tableView.clickedRow
+        if row >= 0 { showPreview(for: row) }
+    }
+
+    private func clearPreview() {
+        pendingJump = nil
+        loadToken += 1
+        matchCountLabel.stringValue = ""
+        previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
+    }
+
+    private func showPreview(for row: Int) {
+        guard row >= 0, row < hits.count else {
+            clearPreview()
+            return
+        }
+        let hit = hits[row]
+        let q = currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let count = MarkdownHTML.matchCount(in: hit.body, query: q)
+        if q.isEmpty {
+            matchCountLabel.stringValue = ""
+        } else {
+            matchCountLabel.stringValue = count > 0
+                ? "本篇命中 \(count) 处"
+                : "本篇正文无命中（仅文件名匹配）"
+        }
+        pendingJump = hit.matchText
+        loadToken += 1
+        let token = loadToken
+        let bodyHTML = MarkdownHTML.render(hit.body)
+        let page = Self.wrapHTML(bodyHTML, title: hit.title)
+        // Defer load slightly so rapid ↑↓ doesn't race unfinished navigations.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, token == self.loadToken else { return }
+            self.previewWeb.loadHTMLString(page, baseURL: hit.url.deletingLastPathComponent())
+        }
+    }
+
+    private static func wrapHTML(_ body: String, title: String) -> String {
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <title>\(MarkdownHTMLEscape.escape(title))</title>
+        <style>
+          :root { color-scheme: light dark; }
+          html, body {
+            margin: 0; padding: 0;
+            font: 13px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+            background: Canvas;
+            color: CanvasText;
+          }
+          body { padding: 14px 16px 28px; overflow-wrap: anywhere; word-break: break-word; }
+          h1,h2,h3,h4,h5,h6 { line-height: 1.25; margin: 1.1em 0 0.4em; }
+          h1 { font-size: 1.45em; } h2 { font-size: 1.25em; } h3 { font-size: 1.1em; }
+          p, ul, ol, blockquote, pre { margin: 0.55em 0; }
+          p { white-space: normal; }
+          ul, ol { padding-left: 1.4em; }
+          code, pre {
+            font-family: ui-monospace, Menlo, monospace;
+            font-size: 0.92em;
+          }
+          code {
+            background: rgba(127,127,127,0.15);
+            padding: 0.1em 0.35em;
+            border-radius: 3px;
+          }
+          pre {
+            background: rgba(127,127,127,0.12);
+            padding: 10px 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+          }
+          pre code { background: none; padding: 0; }
+          blockquote {
+            margin-left: 0; padding: 0.2em 0.8em;
+            border-left: 3px solid rgba(127,127,127,0.45);
+            color: gray;
+          }
+          table {
+            border-collapse: collapse;
+            width: 100%;
+            font-size: 12px;
+            margin: 0.4em 0 1em;
+          }
+          th, td {
+            border: 1px solid rgba(127,127,127,0.35);
+            padding: 6px 8px;
+            vertical-align: top;
+            text-align: left;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+          }
+          th { background: rgba(127,127,127,0.12); font-weight: 600; }
+          a { color: #0a84ff; }
+          .wiki {
+            color: #0a84ff;
+            border-bottom: 1px dashed rgba(10,132,255,0.5);
+          }
+          hr { border: none; border-top: 1px solid rgba(127,127,127,0.35); margin: 1em 0; }
+          mark.pq-hit {
+            background: #ffe58a;
+            color: inherit;
+            padding: 0 1px;
+            border-radius: 2px;
+          }
+          @media (prefers-color-scheme: dark) {
+            mark.pq-hit { background: #8a6d1a; color: #fff8d6; }
+            a, .wiki { color: #64b5ff; }
+            th { background: rgba(255,255,255,0.08); }
+          }
+        </style>
+        </head>
+        <body>
+        <article>\(body)</article>
+        <script>
+        window.pqJumpTo = function(q) {
+          if (!q) { window.scrollTo(0, 0); return; }
+          document.querySelectorAll('mark.pq-hit').forEach(function(m) {
+            m.replaceWith(document.createTextNode(m.textContent || ''));
+          });
+          var needle = q.toLowerCase();
+          var first = null;
+          function highlightNode(node) {
+            var text = node.nodeValue || '';
+            var lower = text.toLowerCase();
+            var idx = lower.indexOf(needle);
+            if (idx < 0) return false;
+            var frag = document.createDocumentFragment();
+            var cursor = 0;
+            while (idx >= 0) {
+              if (idx > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, idx)));
+              var mark = document.createElement('mark');
+              mark.className = 'pq-hit';
+              mark.textContent = text.slice(idx, idx + q.length);
+              frag.appendChild(mark);
+              if (!first) first = mark;
+              cursor = idx + q.length;
+              idx = lower.indexOf(needle, cursor);
+            }
+            if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+            node.parentNode.replaceChild(frag, node);
+            return true;
+          }
+          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+          var nodes = [];
+          while (walker.nextNode()) nodes.push(walker.currentNode);
+          nodes.forEach(highlightNode);
+          if (first) first.scrollIntoView({block: 'center', inline: 'nearest'});
+        };
+        </script>
+        </body>
+        </html>
+        """
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        let payload = Self.jsStringLiteral(pendingJump ?? "")
+        webView.evaluateJavaScript("window.pqJumpTo && window.pqJumpTo(\(payload))") { _, _ in }
+    }
+
+    /// JSON string literal suitable for embedding in `evaluateJavaScript`.
+    /// Top-level String is not a valid JSON root — wrap in an array first.
+    private static func jsStringLiteral(_ s: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [s]),
+              let wrapped = String(data: data, encoding: .utf8),
+              wrapped.count >= 2 else { return "\"\"" }
+        return String(wrapped.dropFirst().dropLast())
+    }
+
+    // MARK: NSTableView
+
+    func numberOfRows(in tableView: NSTableView) -> Int { hits.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = NSUserInterfaceItemIdentifier("NoteCell")
+        let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView)
+            ?? {
+                let c = NSTableCellView()
+                c.identifier = id
+                let title = NSTextField(labelWithString: "")
+                title.tag = 1
+                title.font = .systemFont(ofSize: 13, weight: .medium)
+                title.lineBreakMode = .byTruncatingTail
+                title.translatesAutoresizingMaskIntoConstraints = false
+                let sub = NSTextField(labelWithString: "")
+                sub.tag = 2
+                sub.font = .systemFont(ofSize: 11)
+                sub.textColor = .secondaryLabelColor
+                sub.lineBreakMode = .byTruncatingMiddle
+                sub.translatesAutoresizingMaskIntoConstraints = false
+                c.addSubview(title)
+                c.addSubview(sub)
+                c.textField = title
+                NSLayoutConstraint.activate([
+                    title.topAnchor.constraint(equalTo: c.topAnchor, constant: 8),
+                    title.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 12),
+                    title.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -12),
+                    sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 3),
+                    sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+                    sub.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+                    sub.bottomAnchor.constraint(equalTo: c.bottomAnchor, constant: -8),
+                ])
+                return c
+            }()
+        let hit = hits[row]
+        cell.textField?.stringValue = hit.title
+        let dir = (hit.relativePath as NSString).deletingLastPathComponent
+        (cell.viewWithTag(2) as? NSTextField)?.stringValue = dir.isEmpty ? "（库根目录）" : dir
+        cell.toolTip = hit.relativePath
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        if row >= 0 { showPreview(for: row) }
+    }
+}
+
+/// Shared HTML escaping for the preview wrapper (avoids depending on MarkdownHTML's private API).
+private enum MarkdownHTMLEscape {
+    static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+}
+
 // MARK: - Settings window
 
 final class SettingsWindowController: NSObject {
@@ -1514,22 +2445,24 @@ final class SettingsWindowController: NSObject {
     /// own width. Left to size themselves, the label column hugs weakly, the grid
     /// stretches to the full content width and the extra space lands inside the
     /// (trailing-aligned) label column — which shoves the whole block right.
-    private static let labelWidth: CGFloat = 190
-    private static let controlWidth: CGFloat = 180
-    private static let windowWidth: CGFloat = 460
-    private static let margin: CGFloat = 20
+    /// Control column width; label column hugs its text (no fixed empty gutter).
+    private static let controlWidth: CGFloat = 240
+    private static let margin: CGFloat = 16
 
     private var window: NSWindow?
     private let onChange: () -> Void
     private let terminalPopup = NSPopUpButton()
     private let summonPopup = NSPopUpButton()
-    private let finderPopup = NSPopUpButton()
+    private let searchPopup = NSPopUpButton()
     private let openPopup = NSPopUpButton()
     private let historyPopup = NSPopUpButton()
     private let widthPopup = NSPopUpButton()
     private let pathLabel = NSTextField(labelWithString: "")
     private let choosePathButton = NSButton(title: "选择…", target: nil, action: nil)
+    private let vaultLabel = NSTextField(labelWithString: "")
+    private let chooseVaultButton = NSButton(title: "选择…", target: nil, action: nil)
     private var phrasesTextView: NSTextView!
+    private var excludesTextView: NSTextView!
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
@@ -1547,7 +2480,7 @@ final class SettingsWindowController: NSObject {
     private func build() {
         for m in ModifierChoice.allCases {
             summonPopup.addItem(withTitle: m.displayName)
-            finderPopup.addItem(withTitle: m.displayName)
+            searchPopup.addItem(withTitle: m.displayName)
             openPopup.addItem(withTitle: m.displayName)
         }
         for n in [10, 20, 50, 100, 200] { historyPopup.addItem(withTitle: "\(n)") }
@@ -1555,7 +2488,7 @@ final class SettingsWindowController: NSObject {
         // Index 0 is auto; the rest track `TerminalApp.allCases` positionally.
         terminalPopup.addItem(withTitle: "自动")
         for app in TerminalApp.allCases { terminalPopup.addItem(withTitle: app.displayName) }
-        let popups = [terminalPopup, summonPopup, finderPopup, openPopup, historyPopup, widthPopup]
+        let popups = [terminalPopup, summonPopup, searchPopup, openPopup, historyPopup, widthPopup]
         for popup in popups {
             popup.target = self
             popup.action = #selector(changed)
@@ -1580,6 +2513,19 @@ final class SettingsWindowController: NSObject {
         pathRow.alignment = .centerY
         pathRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
 
+        vaultLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        vaultLabel.lineBreakMode = .byTruncatingMiddle
+        vaultLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        chooseVaultButton.bezelStyle = .rounded
+        chooseVaultButton.target = self
+        chooseVaultButton.action = #selector(chooseVaultPath)
+        chooseVaultButton.setContentHuggingPriority(.required, for: .horizontal)
+        let vaultRow = NSStackView(views: [vaultLabel, chooseVaultButton])
+        vaultRow.orientation = .horizontal
+        vaultRow.spacing = 8
+        vaultRow.alignment = .centerY
+        vaultRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+
         // Phrases editor: a small scrollable text view, one phrase per line.
         let phrasesScroll = NSScrollView()
         phrasesTextView = NSTextView()
@@ -1593,65 +2539,131 @@ final class SettingsWindowController: NSObject {
         phrasesScroll.hasVerticalScroller = true
         phrasesScroll.hasHorizontalScroller = false
         phrasesScroll.borderType = .bezelBorder
-        phrasesScroll.heightAnchor.constraint(equalToConstant: 60).isActive = true
+        phrasesScroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
         phrasesScroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
         NotificationCenter.default.addObserver(
             self, selector: #selector(phrasesChanged),
             name: NSText.didChangeNotification, object: phrasesTextView)
+
+        let excludesScroll = NSScrollView()
+        excludesTextView = NSTextView()
+        excludesTextView.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        excludesTextView.isRichText = false
+        excludesTextView.isAutomaticQuoteSubstitutionEnabled = false
+        excludesTextView.isAutomaticDashSubstitutionEnabled = false
+        excludesTextView.allowsUndo = true
+        excludesTextView.textContainerInset = NSSize(width: 4, height: 4)
+        excludesScroll.documentView = excludesTextView
+        excludesScroll.hasVerticalScroller = true
+        excludesScroll.hasHorizontalScroller = false
+        excludesScroll.borderType = .bezelBorder
+        excludesScroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
+        excludesScroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(excludesChanged),
+            name: NSText.didChangeNotification, object: excludesTextView)
 
         func row(_ label: String, _ control: NSView) -> [NSView] {
             let l = NSTextField(labelWithString: label)
             l.alignment = .right
             return [l, control]
         }
-        let grid = NSGridView(views: [
-            row("目标终端：", terminalPopup),
-            row("双击呼出编辑器：", summonPopup),
-            row("双击插入 Finder 选中项：", finderPopup),
-            row("双击用 \(ExternalEditor.displayName) 打开：", openPopup),
-            row("历史保留条数：", historyPopup),
-            row("菜单标题最大字数：", widthPopup),
-            row("⌘⇧4 截图保存路径：", pathRow),
-            row("常用语（每行一条）：", phrasesScroll),
-        ])
-        grid.rowSpacing = 12
-        grid.columnSpacing = 10
-        // Baseline alignment (the default) leaves the label sitting visibly high
-        // against a bezelled popup; centre each row instead.
-        grid.rowAlignment = .none
-        for i in 0..<grid.numberOfRows { grid.row(at: i).yPlacement = .center }
-        grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 0).width = Self.labelWidth
-        grid.column(at: 1).xPlacement = .leading
-        grid.column(at: 1).width = Self.controlWidth
-        grid.setContentHuggingPriority(.required, for: .horizontal)
+        func makeGrid(_ rows: [[NSView]], footnote: String) -> NSView {
+            let grid = NSGridView(views: rows)
+            grid.rowSpacing = 12
+            grid.columnSpacing = 8
+            grid.rowAlignment = .none
+            for i in 0..<grid.numberOfRows { grid.row(at: i).yPlacement = .center }
+            // Hug label text — a fixed column width left a large empty gutter.
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 1).xPlacement = .leading
+            grid.column(at: 1).width = Self.controlWidth
+            grid.setContentHuggingPriority(.required, for: .horizontal)
 
-        let textWidth = Self.windowWidth - Self.margin * 2
-        let note = NSTextField(wrappingLabelWithString:
-            "三个双击手势请用不同的修饰键，否则会冲突。"
-            + "截图路径写入系统设置（com.apple.screencapture），重启后仍生效。改动即时生效。")
-        note.font = .systemFont(ofSize: 11)
-        note.textColor = .secondaryLabelColor
-        note.alignment = .center
-        note.preferredMaxLayoutWidth = textWidth
-        note.widthAnchor.constraint(equalToConstant: textWidth).isActive = true
+            let note = NSTextField(wrappingLabelWithString: footnote)
+            note.font = .systemFont(ofSize: 11)
+            note.textColor = .secondaryLabelColor
+            note.alignment = .center
+            note.preferredMaxLayoutWidth = Self.controlWidth + 100
+            note.translatesAutoresizingMaskIntoConstraints = false
+
+            let stack = NSStackView(views: [grid, note])
+            stack.orientation = .vertical
+            stack.alignment = .centerX
+            stack.spacing = 14
+            stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            // Pin to the top of the tab so short pages (手势 / 笔记) don't float
+            // to the vertical middle of the fixed-height tab view.
+            let wrap = NSView()
+            wrap.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+                stack.topAnchor.constraint(equalTo: wrap.topAnchor),
+                stack.bottomAnchor.constraint(
+                    lessThanOrEqualTo: wrap.bottomAnchor),
+                note.widthAnchor.constraint(equalTo: grid.widthAnchor),
+            ])
+            return wrap
+        }
+
+        let generalTab = makeGrid([
+            row("目标终端：", terminalPopup),
+            row("历史条数：", historyPopup),
+            row("菜单标题字数：", widthPopup),
+            row("截图保存路径：", pathRow),
+            row("常用语：", phrasesScroll),
+        ], footnote: "截图路径写入系统设置（com.apple.screencapture），重启后仍生效。改动即时生效。")
+
+        let gestureTab = makeGrid([
+            row("呼出编辑器：", summonPopup),
+            row("搜索笔记：", searchPopup),
+            row("打开文件：", openPopup),
+        ], footnote: "均为双击对应修饰键。三个手势请用不同修饰键，否则会冲突。")
+
+        let notesTab = makeGrid([
+            row("笔记库路径：", vaultRow),
+            row("排除目录：", excludesScroll),
+        ], footnote: "排除目录每行一个，默认 .obsidian、.trash。双击 Option（可在「手势」中改）打开搜索。")
+
+        let tabView = NSTabView()
+        tabView.tabViewType = .topTabsBezelBorder
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+        let tabs: [(String, NSView)] = [
+            ("通用", generalTab),
+            ("手势", gestureTab),
+            ("笔记", notesTab),
+        ]
+        for (title, view) in tabs {
+            let item = NSTabViewItem(identifier: title)
+            item.label = title
+            item.view = view
+            tabView.addTabViewItem(item)
+        }
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let versionLabel = NSTextField(labelWithString: "版本 \(version)")
         versionLabel.font = .systemFont(ofSize: 11)
         versionLabel.textColor = .tertiaryLabelColor
+        versionLabel.alignment = .center
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [grid, note, versionLabel])
+        let stack = NSStackView(views: [tabView, versionLabel])
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 16
-        stack.setCustomSpacing(28, after: note)
+        stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(
             top: Self.margin, left: Self.margin, bottom: Self.margin, right: Self.margin)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
+        let tabWidth = Self.controlWidth + 120 + 8 + 28
+        tabView.widthAnchor.constraint(equalToConstant: tabWidth).isActive = true
+        // Tall enough for the largest tab (通用) without jumping when switching.
+        tabView.heightAnchor.constraint(equalToConstant: 320).isActive = true
+
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: Self.windowWidth, height: 240),
+            contentRect: NSRect(x: 0, y: 0, width: tabWidth + Self.margin * 2, height: 400),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "设置"
         w.isReleasedWhenClosed = false
@@ -1665,17 +2677,15 @@ final class SettingsWindowController: NSObject {
         ])
         w.contentView = content
         content.layoutSubtreeIfNeeded()
-        // Height follows the content: a hard-coded one left slack that the stack
-        // distributed between the rows, so the spacing drifted. The width stays
-        // fixed — deriving it from `fittingSize` lets the label column compress
-        // and the grid overflow the right margin.
-        w.setContentSize(NSSize(width: Self.windowWidth, height: content.fittingSize.height))
+        w.setContentSize(NSSize(
+            width: tabWidth + Self.margin * 2,
+            height: content.fittingSize.height))
         window = w
     }
 
     private func syncFromSettings() {
         summonPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.summonModifier) ?? 0)
-        finderPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.finderModifier) ?? 0)
+        searchPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.searchModifier) ?? 0)
         openPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.openModifier) ?? 0)
         historyPopup.selectItem(withTitle: "\(Settings.historyLimit)")
         widthPopup.selectItem(withTitle: "\(Settings.labelWidth)")
@@ -1683,12 +2693,15 @@ final class SettingsWindowController: NSObject {
             .flatMap { TerminalApp.allCases.firstIndex(of: $0) }.map { $0 + 1 } ?? 0)
         pathLabel.stringValue = ScreenshotLocation.displayPath
         pathLabel.toolTip = ScreenshotLocation.url.path
+        vaultLabel.stringValue = displayPath(Settings.notesVaultPath)
+        vaultLabel.toolTip = Settings.notesVaultPath
+        excludesTextView.string = Settings.notesExcludeDirs.joined(separator: "\n")
         phrasesTextView.string = Settings.quickPhrases.joined(separator: "\n")
     }
 
     @objc private func changed() {
         Settings.summonModifier = ModifierChoice.allCases[summonPopup.indexOfSelectedItem]
-        Settings.finderModifier = ModifierChoice.allCases[finderPopup.indexOfSelectedItem]
+        Settings.searchModifier = ModifierChoice.allCases[searchPopup.indexOfSelectedItem]
         Settings.openModifier = ModifierChoice.allCases[openPopup.indexOfSelectedItem]
         if let n = Int(historyPopup.titleOfSelectedItem ?? "") { Settings.historyLimit = n }
         if let w = Int(widthPopup.titleOfSelectedItem ?? "") { Settings.labelWidth = w }
@@ -1702,6 +2715,37 @@ final class SettingsWindowController: NSObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         Settings.quickPhrases = lines
+    }
+
+    @objc private func excludesChanged() {
+        let lines = excludesTextView.string.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        Settings.notesExcludeDirs = lines
+    }
+
+    private func displayPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    @objc private func chooseVaultPath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "选择"
+        panel.message = "选择 Obsidian / Markdown 笔记库根目录"
+        panel.directoryURL = URL(fileURLWithPath: Settings.notesVaultPath, isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Settings.notesVaultPath = url.path
+        vaultLabel.stringValue = displayPath(url.path)
+        vaultLabel.toolTip = url.path
+        onChange()
     }
 
     @objc private func chooseScreenshotPath() {
@@ -1732,8 +2776,9 @@ final class SettingsWindowController: NSObject {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let panel = EditorPanel()
+    private let notesPanel = NotesSearchPanel()
     private var summonMonitor: DoubleTapMonitor?
-    private var finderMonitor: DoubleTapMonitor?
+    private var searchMonitor: DoubleTapMonitor?
     private var openMonitor: DoubleTapMonitor?
     private var phrasesKeyMonitors: [Any] = []
     private var screenshotWatcher: ScreenshotWatcher!
@@ -1764,18 +2809,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (Re)create the double-tap monitors from the current settings.
     private func restartMonitors() {
         summonMonitor?.stop()
-        finderMonitor?.stop()
+        searchMonitor?.stop()
         openMonitor?.stop()
         let summon = Settings.summonModifier
         summonMonitor = DoubleTapMonitor(
             keyCodes: summon.keyCodes, flag: summon.flag,
             interval: Settings.doubleTapInterval) { [weak self] in self?.onSummon() }
         summonMonitor?.start()
-        let finder = Settings.finderModifier
-        finderMonitor = DoubleTapMonitor(
-            keyCodes: finder.keyCodes, flag: finder.flag,
-            interval: Settings.doubleTapInterval) { [weak self] in self?.onFinderPaste() }
-        finderMonitor?.start()
+        let search = Settings.searchModifier
+        searchMonitor = DoubleTapMonitor(
+            keyCodes: search.keyCodes, flag: search.flag,
+            interval: Settings.doubleTapInterval) { [weak self] in self?.onNotesSearch() }
+        searchMonitor?.start()
         let open = Settings.openModifier
         openMonitor = DoubleTapMonitor(
             keyCodes: open.keyCodes, flag: open.flag,
@@ -1882,6 +2927,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let open = menu.addItem(withTitle: "打开编辑器", action: #selector(showEditor), keyEquivalent: "")
         open.target = self
+        let notes = menu.addItem(withTitle: "搜索笔记…", action: #selector(showNotesSearch), keyEquivalent: "")
+        notes.target = self
         menu.addItem(.separator())
 
         let phrases = Settings.quickPhrases
@@ -1934,6 +2981,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showEditor() { panel.showAndFocus() }
 
+    @objc private func showNotesSearch() { notesPanel.showAndFocus() }
+
     @objc private func pickPhrase(_ sender: NSMenuItem) {
         let phrases = Settings.quickPhrases
         guard sender.tag >= 0, sender.tag < phrases.count else { return }
@@ -1970,13 +3019,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Double-tap Option: insert the current Finder selection's paths.
-    private func onFinderPaste() {
-        let paths = FinderSelection.paths()
-        guard !paths.isEmpty else { NSSound.beep(); return }
-        let joined = paths.map { PathFormat.forInsertion($0) }.joined(separator: "\n")
-        panel.showAndFocus()
-        panel.insertAtCursor(joined + "\n")
+    /// Double-tap Option: open the notes search panel.
+    private func onNotesSearch() {
+        notesPanel.showAndFocus()
     }
 
     /// Double-tap Command: open the current Finder selection in Sublime Text.

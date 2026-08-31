@@ -14,7 +14,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Always-on-top editor**: floats above every app, visible across Spaces / full-screen; draggable, resizable, remembers its frame
 - **Double-tap Control to summon**: inserts the frontmost app's selection (Accessibility API first, falls back to a synthesized ⌘C)
 - **Drag files in** to insert their paths
-- **Double-tap Option** to insert the current Finder selection's paths
+- **Double-tap Option** to search Markdown notes (Obsidian vault etc.): floating always-on-top panel with Markdown preview (select/copy, jumps to the first match); vault path and exclude dirs in Settings
 - **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
 - **Voice dictation**: hold right Option to start recording (real-time streaming recognition), release to stop; a red pulsing dot + "录音中…" indicator appears in the bottom bar. Transcription appears live at the cursor and finalizes on release. Powered by macOS's native SFSpeechRecognizer — no external dependencies
@@ -22,14 +22,14 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **One-key send**: ⌘↵ → if several terminal windows/tabs exist, pick one by title → text is pasted into Claude and submitted; the editor clears
 - **Terminal.app, iTerm2 & Otty**: send to any (or auto-detect); choose the target in Settings
 - **History** of sent messages in the menu; click to reload into the editor
-- **Customizable**: the three double-tap modifiers, target terminal, history size, menu label width, and the ⌘⇧4 screenshot save folder (writes the system preference so it survives reboot; menu → Settings…)
+- **Customizable**: the three double-tap modifiers, notes vault path / exclude dirs, target terminal, history size, menu label width, and the ⌘⇧4 screenshot save folder (writes the system preference so it survives reboot; menu → Settings…)
 
 ## Gestures
 
 | Action | Effect |
 |---|---|
 | Double-tap **Control** | Summon the editor; insert the selection if any |
-| Double-tap **Option** | Insert the current Finder selection's paths |
+| Double-tap **Option** | Search notes (filename + body); Markdown preview, jump to match |
 | Double-tap **Command** | Open the current Finder selection in Sublime Text |
 | **Hold right Option** | Voice dictation (live transcription, release to stop); red pulsing dot indicator |
 | **⌃1–⌃9** | Insert the corresponding quick phrase at the cursor |

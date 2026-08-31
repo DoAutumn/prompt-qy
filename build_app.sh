@@ -27,6 +27,8 @@ echo "==> Compiling Swift binary"
 # Pin the deployment target so the Mach-O runs on older macOS (see sibling repo).
 DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"
 swiftc -O -target "$(uname -m)-apple-macos${DEPLOYMENT_TARGET}" \
+    -framework Cocoa -framework ApplicationServices -framework Speech \
+    -framework AVFoundation -framework WebKit \
     -o "$APP/Contents/MacOS/PromptQy" "$ROOT/command_bar.swift"
 
 echo "==> Writing Info.plist (version $VERSION)"
