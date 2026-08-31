@@ -704,7 +704,9 @@ final class ScreenshotWatcher {
     private var fd: Int32 = -1
     private var dir: URL = FileManager.default.homeDirectoryForCurrentUser
     private var seen: Set<String> = []
-    private var notified: Set<String> = []  // files already reported, never repeat
+    /// Paths already reported; pruned against the current directory listing so
+    /// it cannot grow without bound across long-running sessions.
+    private var notified: Set<String> = []
     private let onNew: (URL) -> Void
 
     init(onNew: @escaping (URL) -> Void) {
@@ -729,6 +731,7 @@ final class ScreenshotWatcher {
         stop()
         dir = ScreenshotLocation.url
         seen = currentImages()
+        notified = []
         fd = open(dir.path, O_EVTONLY)
         guard fd >= 0 else {
             NSLog("ScreenshotWatcher: cannot open \(dir.path)")
@@ -758,6 +761,10 @@ final class ScreenshotWatcher {
         let now = currentImages()
         let added = now.subtracting(seen)
         seen = now
+        // Drop entries for files that no longer exist in the folder.
+        let livePaths = Set(now.map { dir.appendingPathComponent($0).path })
+        notified = notified.intersection(livePaths)
+
         let urls = added.map { dir.appendingPathComponent($0) }
         guard let newest = urls.max(by: { mtime($0) < mtime($1) }) else { return }
         // A single capture can fire multiple vnode events (write + rename +
@@ -887,6 +894,7 @@ final class DoubleTapMonitor {
     }
 
     func start() {
+        stop()  // avoid stacking monitors if start() is called twice
         add(.flagsChanged) { [weak self] event in self?.handle(event) }
         // A modifier held down for a shortcut produces a press edge too, so ⌘C
         // then ⌘V (or ⌃C twice in a terminal), and ⌘-clicking two files in
@@ -1535,15 +1543,17 @@ final class EditorPanel: NSPanel {
 // MARK: - Markdown notes search
 
 /// One hit from the vault. `rank` 0 = filename match (preferred), 1 = body only.
+/// Body text is loaded on demand for preview — search only keeps metadata so a
+/// large vault does not pin every note in RAM.
 struct NoteHit {
     let url: URL
     let relativePath: String
     let title: String
     let rank: Int
-    let snippet: String
-    let body: String
-    /// First body match as it appears in `body` (for preview jump); nil if none.
-    let matchText: String?
+
+    func loadBody() -> String {
+        (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
 }
 
 /// Scans a Markdown vault (Obsidian etc.) for `.md` files. Fine for ~hundreds
@@ -1582,34 +1592,38 @@ enum MarkdownVault {
             }
 
             let title = url.deletingPathExtension().lastPathComponent
-            let body = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            let matchText = firstMatch(in: body, matching: qLower)
 
             if q.isEmpty {
-                hits.append(NoteHit(
-                    url: url, relativePath: rel, title: title,
-                    rank: 0, snippet: firstLine(body), body: body, matchText: nil))
+                // Listing only — no file I/O.
+                hits.append(NoteHit(url: url, relativePath: rel, title: title, rank: 0))
                 continue
             }
 
             let nameHit = title.lowercased().contains(qLower)
                 || rel.lowercased().contains(qLower)
-            let bodyHit = matchText != nil
-            guard nameHit || bodyHit else { continue }
-            hits.append(NoteHit(
-                url: url, relativePath: rel, title: title,
-                rank: nameHit ? 0 : 1,
-                snippet: nameHit && matchText == nil
-                    ? firstLine(body)
-                    : (matchText.map { snippet(in: body, matching: $0.lowercased()) } ?? firstLine(body)),
-                body: body,
-                matchText: matchText))
+            if nameHit {
+                hits.append(NoteHit(url: url, relativePath: rel, title: title, rank: 0))
+                continue
+            }
+
+            // Body match: read once to decide membership, discard the text.
+            let body = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            guard body.lowercased().contains(qLower) else { continue }
+            hits.append(NoteHit(url: url, relativePath: rel, title: title, rank: 1))
         }
 
         return hits.sorted {
             if $0.rank != $1.rank { return $0.rank < $1.rank }
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+    }
+
+    static func firstMatch(in body: String, matching needle: String) -> String? {
+        let n = needle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty else { return nil }
+        let lower = body.lowercased()
+        guard let range = lower.range(of: n.lowercased()) else { return nil }
+        return String(body[range])
     }
 
     private static func relativePath(_ url: URL, root: URL) -> String {
@@ -1632,29 +1646,6 @@ enum MarkdownVault {
             if relative == ex || relative.hasPrefix(ex + "/") { return true }
         }
         return false
-    }
-
-    private static func firstLine(_ body: String) -> String {
-        let line = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return trimmed.count > 80 ? String(trimmed.prefix(77)) + "…" : trimmed
-    }
-
-    private static func firstMatch(in body: String, matching needle: String) -> String? {
-        guard !needle.isEmpty else { return nil }
-        let lower = body.lowercased()
-        guard let range = lower.range(of: needle) else { return nil }
-        return String(body[range])
-    }
-
-    private static func snippet(in body: String, matching needle: String) -> String {
-        let lower = body.lowercased()
-        guard let range = lower.range(of: needle) else { return firstLine(body) }
-        let lineStart = body[..<range.lowerBound].lastIndex(where: { $0.isNewline })
-            .map { body.index(after: $0) } ?? body.startIndex
-        let lineEnd = body[range.upperBound...].firstIndex(where: { $0.isNewline }) ?? body.endIndex
-        let line = String(body[lineStart..<lineEnd]).trimmingCharacters(in: .whitespaces)
-        return line.count > 100 ? String(line.prefix(97)) + "…" : line
     }
 }
 
@@ -1966,6 +1957,10 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     private var loadToken = 0
     private var currentQuery = ""
     private var didApplyInitialSplit = false
+    private var splitInitRetries = 0
+    /// Last previewed note + query — skip redundant WKWebView reloads.
+    private var previewedPath: String?
+    private var previewedQuery: String?
 
     init() {
         super.init(
@@ -1989,6 +1984,28 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
     override func close() { orderOut(nil) }
 
+    override func orderOut(_ sender: Any?) {
+        releasePreviewResources()
+        super.orderOut(sender)
+    }
+
+    /// Drop list bodies / WebKit document while the panel is hidden.
+    private func releasePreviewResources() {
+        searchWork?.cancel()
+        searchWork = nil
+        searchGeneration += 1
+        loadToken += 1
+        pendingJump = nil
+        previewedPath = nil
+        previewedQuery = nil
+        hits = []
+        tableView.reloadData()
+        matchCountLabel.stringValue = ""
+        statusLabel.stringValue = ""
+        previewWeb.stopLoading()
+        previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
+    }
+
     func showAndFocus() {
         if !isVisible { center() }
         searchField.stringValue = ""
@@ -2004,7 +2021,8 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         contentView?.layoutSubtreeIfNeeded()
         let total = split.bounds.width
         guard total > 0 else {
-            // Frame may not be ready on first call — retry once next turn.
+            splitInitRetries += 1
+            guard splitInitRetries < 10 else { return }
             DispatchQueue.main.async { [weak self] in self?.applyInitialSplitIfNeeded() }
             return
         }
@@ -2183,6 +2201,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
                 guard let self = self, gen == self.searchGeneration else { return }
                 self.hits = results
                 self.tableView.reloadData()
+                self.previewedPath = nil  // force preview refresh for new results
                 if results.isEmpty {
                     self.clearPreview()
                     let exists = FileManager.default.fileExists(atPath: vault)
@@ -2191,6 +2210,8 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
                         : "笔记库路径不存在：\(vault)"
                 } else {
                     self.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+                    // selectRowIndexes is a no-op when row 0 was already selected,
+                    // so selectionDidChange may not fire — always show once here.
                     self.showPreview(for: 0)
                     self.statusLabel.stringValue = "\(results.count) 条 · Esc 关闭 · 预览中可框选复制"
                 }
@@ -2202,20 +2223,23 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         guard !hits.isEmpty else { return }
         let current = tableView.selectedRow >= 0 ? tableView.selectedRow : 0
         let next = max(0, min(hits.count - 1, current + delta))
+        guard next != tableView.selectedRow else { return }
         tableView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
         tableView.scrollRowToVisible(next)
-        showPreview(for: next)
+        // Preview via selectionDidChange.
     }
 
     @objc private func tableClicked() {
-        let row = tableView.clickedRow
-        if row >= 0 { showPreview(for: row) }
+        // Selection change drives preview; nothing else needed.
     }
 
     private func clearPreview() {
         pendingJump = nil
         loadToken += 1
+        previewedPath = nil
+        previewedQuery = nil
         matchCountLabel.stringValue = ""
+        previewWeb.stopLoading()
         previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
     }
 
@@ -2226,7 +2250,15 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         }
         let hit = hits[row]
         let q = currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let count = MarkdownHTML.matchCount(in: hit.body, query: q)
+        let path = hit.url.path
+        if previewedPath == path, previewedQuery == q { return }
+        previewedPath = path
+        previewedQuery = q
+
+        // Load body only for the selected note.
+        let body = hit.loadBody()
+        let matchText = MarkdownVault.firstMatch(in: body, matching: q)
+        let count = MarkdownHTML.matchCount(in: body, query: q)
         if q.isEmpty {
             matchCountLabel.stringValue = ""
         } else {
@@ -2234,10 +2266,10 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
                 ? "本篇命中 \(count) 处"
                 : "本篇正文无命中（仅文件名匹配）"
         }
-        pendingJump = hit.matchText
+        pendingJump = matchText
         loadToken += 1
         let token = loadToken
-        let bodyHTML = MarkdownHTML.render(hit.body)
+        let bodyHTML = MarkdownHTML.render(body)
         let page = Self.wrapHTML(bodyHTML, title: hit.title)
         // Defer load slightly so rapid ↑↓ doesn't race unfinished navigations.
         DispatchQueue.main.async { [weak self] in
