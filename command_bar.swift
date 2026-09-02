@@ -697,16 +697,26 @@ enum TerminalSender {
 
 // MARK: - Screenshot watcher
 
-/// Watches the macOS screenshot folder and reports newly created image files,
+/// Watches the macOS screenshot folder and reports newly written image files,
 /// so Cmd+Shift+4 captures can drop their path straight into the editor.
+///
+/// Directory vnode events miss in-place overwrites of an existing filename, so
+/// a short poll also compares mtimes against a per-path baseline. A brief
+/// per-path debounce absorbs mtime jitter from a single capture (vnode + poll)
+/// so a new filename inserts only once.
 final class ScreenshotWatcher {
     private var source: DispatchSourceFileSystemObject?
     private var fd: Int32 = -1
+    private var pollTimer: Timer?
     private var dir: URL = FileManager.default.homeDirectoryForCurrentUser
-    private var seen: Set<String> = []
-    /// Paths already reported; pruned against the current directory listing so
-    /// it cannot grow without bound across long-running sessions.
-    private var notified: Set<String> = []
+    /// Last mtime we reported (or seeded at start) per path; pruned against
+    /// the current directory listing so it cannot grow without bound.
+    private var lastNotifiedMtime: [String: Date] = [:]
+    /// When we last inserted each path; used to debounce multi-event captures.
+    private var lastNotifiedAt: [String: Date] = [:]
+    /// Ignore further mtime bumps for the same path within this window so one
+    /// new capture inserts once; later overwrites still notify after it ends.
+    private let notifyDebounce: TimeInterval = 3
     private let onNew: (URL) -> Void
 
     init(onNew: @escaping (URL) -> Void) {
@@ -715,6 +725,8 @@ final class ScreenshotWatcher {
 
     /// Stop watching. Safe to call when not started.
     func stop() {
+        pollTimer?.invalidate()
+        pollTimer = nil
         source?.setEventHandler {}
         source?.setCancelHandler {}
         source?.cancel()
@@ -730,8 +742,14 @@ final class ScreenshotWatcher {
     func start() {
         stop()
         dir = ScreenshotLocation.url
-        seen = currentImages()
-        notified = []
+        // Seed baselines for files already on disk so we only react to later
+        // writes (including overwrites of the same name).
+        lastNotifiedMtime = [:]
+        lastNotifiedAt = [:]
+        for name in currentImages() {
+            let url = dir.appendingPathComponent(name)
+            lastNotifiedMtime[url.path] = mtime(url)
+        }
         fd = open(dir.path, O_EVTONLY)
         guard fd >= 0 else {
             NSLog("ScreenshotWatcher: cannot open \(dir.path)")
@@ -742,6 +760,13 @@ final class ScreenshotWatcher {
         s.setEventHandler { [weak self] in self?.scan() }
         source = s
         s.resume()
+        // In-place overwrite does not always dirty the directory vnode; poll
+        // mtimes so same-name rewrites still insert their path.
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.scan()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        pollTimer = t
     }
 
     private func currentImages() -> Set<String> {
@@ -759,23 +784,36 @@ final class ScreenshotWatcher {
 
     private func scan() {
         let now = currentImages()
-        let added = now.subtracting(seen)
-        seen = now
         // Drop entries for files that no longer exist in the folder.
         let livePaths = Set(now.map { dir.appendingPathComponent($0).path })
-        notified = notified.intersection(livePaths)
+        lastNotifiedMtime = lastNotifiedMtime.filter { livePaths.contains($0.key) }
+        lastNotifiedAt = lastNotifiedAt.filter { livePaths.contains($0.key) }
 
-        let urls = added.map { dir.appendingPathComponent($0) }
-        guard let newest = urls.max(by: { mtime($0) < mtime($1) }) else { return }
-        // A single capture can fire multiple vnode events (write + rename +
-        // metadata); guarantee we insert each file's path at most once.
-        let path = newest.path
-        guard !notified.contains(path) else { return }
-        // Ignore files merely moved in; only react to fresh captures.
-        if Date().timeIntervalSince(mtime(newest)) < 10 {
-            notified.insert(path)
-            onNew(newest)
+        // React to fresh writes — both new filenames and overwrites of existing
+        // ones. Ignore files merely moved/copied in (stale mtime).
+        let candidates = now.compactMap { name -> URL? in
+            let url = dir.appendingPathComponent(name)
+            let path = url.path
+            let mod = mtime(url)
+            guard Date().timeIntervalSince(mod) < 10 else { return nil }
+            // Same capture often bumps mtime several times (write + rename +
+            // metadata + poll). Absorb those without a second insert.
+            if let notifiedAt = lastNotifiedAt[path],
+               Date().timeIntervalSince(notifiedAt) < notifyDebounce {
+                if mod > (lastNotifiedMtime[path] ?? .distantPast) {
+                    lastNotifiedMtime[path] = mod
+                }
+                return nil
+            }
+            if let last = lastNotifiedMtime[path], mod <= last { return nil }
+            return url
         }
+        guard let newest = candidates.max(by: { mtime($0) < mtime($1) }) else { return }
+        let path = newest.path
+        let mod = mtime(newest)
+        lastNotifiedMtime[path] = mod
+        lastNotifiedAt[path] = Date()
+        onNew(newest)
     }
 
     private func mtime(_ url: URL) -> Date {
@@ -1243,6 +1281,13 @@ final class EditorPanel: NSPanel {
                 self.makeFirstResponder(self.textView)
             }
         }
+    }
+
+    /// Show the floating editor without activating the app. Used when a
+    /// screenshot path is auto-inserted so Finder's "Replace?" rename dialog
+    /// is not interrupted (and shown again).
+    func showWithoutActivating() {
+        orderFrontRegardless()
     }
 
     func toggle() {
@@ -2829,7 +2874,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         screenshotWatcher = ScreenshotWatcher { [weak self] url in
             guard let self = self else { return }
-            if !self.panel.isVisible { self.panel.showAndFocus() }
+            // Don't activate — stealing focus mid-rename makes Finder re-show
+            // its "replace existing file?" dialog a second time.
+            if !self.panel.isVisible { self.panel.showWithoutActivating() }
             self.panel.insertAtCursor(PathFormat.forInsertion(url.path) + "\n")
         }
         screenshotWatcher.start()
