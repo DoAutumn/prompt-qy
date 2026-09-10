@@ -14,7 +14,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Always-on-top editor**: floats above every app, visible across Spaces / full-screen; draggable, resizable, remembers its frame
 - **Double-tap Control to summon**: inserts the frontmost app's selection (Accessibility API first, falls back to a synthesized ⌘C)
 - **Drag files in** to insert their paths
-- **Double-tap Option** to search Markdown notes (Obsidian vault etc.): floating always-on-top panel with Markdown preview (select/copy, jumps to the first match); vault path and exclude dirs in Settings
+- **Double-tap Option** to search Markdown / `.sheet` notes (Obsidian vault etc.): floating always-on-top panel with Markdown or spreadsheet table preview (select/copy, jumps to the first match); vault path and exclude dirs in Settings
 - **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
 - **Voice dictation**: hold right Option to start recording (real-time streaming recognition), release to stop; a red pulsing dot + "录音中…" indicator appears in the bottom bar. Transcription appears live at the cursor and finalizes on release. Powered by macOS's native SFSpeechRecognizer — no external dependencies
@@ -29,7 +29,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 | Action | Effect |
 |---|---|
 | Double-tap **Control** | Summon the editor; insert the selection if any |
-| Double-tap **Option** | Search notes (filename + body); Markdown preview, jump to match |
+| Double-tap **Option** | Search notes (`.md` / `.sheet`, filename + body); preview, jump to match |
 | Double-tap **Command** | Open the current Finder selection in Sublime Text |
 | **Hold right Option** | Voice dictation (live transcription, release to stop); red pulsing dot indicator |
 | **⌃1–⌃9** | Insert the corresponding quick phrase at the cursor |
