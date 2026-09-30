@@ -23,6 +23,11 @@ swift "$ROOT/generate_icon.swift" "$ICONSET"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 
+echo "==> Installing menu-bar template icon"
+# Hand-designed template (black-on-transparent); see assets/MenuBarIcon*.png
+cp "$ROOT/assets/MenuBarIcon.png" "$ROOT/assets/MenuBarIcon@2x.png" \
+    "$APP/Contents/Resources/"
+
 echo "==> Compiling Swift binary"
 # Pin the deployment target so the Mach-O runs on older macOS (see sibling repo).
 DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"

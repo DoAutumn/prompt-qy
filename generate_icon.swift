@@ -2,6 +2,9 @@
 // Theme: a text-input field with a chevron prompt and a caret — evoking the
 // composer that feeds a terminal. Used by build_app.sh:
 //   swift generate_icon.swift <output.iconset>
+//
+// Menu-bar template icons live in assets/MenuBarIcon.png (+ @2x) and are
+// copied into the app bundle by build_app.sh (not generated here).
 
 import AppKit
 import Foundation

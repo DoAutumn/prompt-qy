@@ -3402,14 +3402,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-               let icon = NSImage(contentsOf: url) {
-                icon.size = NSSize(width: 18, height: 18)
-                icon.isTemplate = false  // keep the colored app-icon look
+            // Dedicated menu-bar template: flat gray-black silhouette (system-tinted).
+            // MenuBarIcon.png + MenuBarIcon@2x.png live in Resources/.
+            if let icon = NSImage(named: "MenuBarIcon") {
+                icon.size = NSSize(width: 19, height: 19)
+                icon.isTemplate = true
+                button.image = icon
+            } else if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+                      let icon = NSImage(contentsOf: url) {
+                icon.size = NSSize(width: 19, height: 19)
+                icon.isTemplate = true
                 button.image = icon
             } else {
-                button.image = NSImage(
+                let sym = NSImage(
                     systemSymbolName: "text.cursor", accessibilityDescription: "PromptQy")
+                sym?.isTemplate = true
+                button.image = sym
             }
         }
         let menu = NSMenu()
