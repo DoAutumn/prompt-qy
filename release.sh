@@ -99,9 +99,9 @@ cask "$CASK_TOKEN" do
   # Gatekeeper refuse the first launch ("damaged, move to Trash"). Strip it here
   # rather than making every user remember \`--no-quarantine\` on install *and*
   # upgrade. Only possible in a third-party tap; homebrew-cask forbids this.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/PromptQy.app"]
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args: ["-dr", "com.apple.quarantine", "{{appdir}}/PromptQy.app"]
   end
 
   uninstall quit: "io.github.promptqy"

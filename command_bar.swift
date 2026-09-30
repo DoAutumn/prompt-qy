@@ -2129,31 +2129,162 @@ enum MarkdownHTML {
 
 // MARK: - Notes search panel (Spotlight-like)
 
-/// Search field that forwards ↑/↓ to the results list.
-private final class NotesSearchField: NSSearchField {
-    var onMoveUp: (() -> Void)?
-    var onMoveDown: (() -> Void)?
+/// Spotlight-style search field: hugs committed text; while editing, keeps a
+/// stable minimum width so IME 拼音 composition is never interrupted by Auto
+/// Layout resizing the field editor (that was committing letter 1 when letter 2
+/// arrived). ↑/↓ / Esc via `control:doCommandBy` only — never override keyDown.
+private final class NotesSearchField: NSTextField {
+    var onContentSizeMayChange: (() -> Void)?
 
-    override func keyDown(with event: NSEvent) {
-        switch event.keyCode {
-        case 126: onMoveUp?()
-        case 125: onMoveDown?()
-        default: super.keyDown(with: event)
+    /// Width reserved for the whole time the field is first-responder / editing.
+    /// Must fit a typical 拼音 syllable without mid-composition resize.
+    private let editingFloor: CGFloat = 200
+    private let rightMargin: CGFloat = 8
+    private var lastSize: NSSize?
+    private var isEditing = false
+
+    override var stringValue: String {
+        didSet {
+            guard !isEditing else { return }
+            lastSize = sizeForText(stringValue)
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    private func sizeForText(_ string: String) -> NSSize {
+        let font = self.font ?? NSFont.systemFont(ofSize: 15)
+        let width = NSAttributedString(string: string, attributes: [.font: font]).size().width
+        var size = super.intrinsicContentSize
+        size.width = max(4, width + (string.isEmpty ? 0 : rightMargin))
+        return size
+    }
+
+    override func textDidBeginEditing(_ notification: Notification) {
+        super.textDidBeginEditing(notification)
+        isEditing = true
+        // One synchronous widen *before* any marked text. Do not resize again
+        // until committed text changes — resizing mid-IME commits 拼音.
+        var size = super.intrinsicContentSize
+        size.width = max(lastSize?.width ?? 0, editingFloor)
+        lastSize = size
+        invalidateIntrinsicContentSize()
+        onContentSizeMayChange?()
+    }
+
+    override func textDidEndEditing(_ notification: Notification) {
+        super.textDidEndEditing(notification)
+        isEditing = false
+        lastSize = sizeForText(stringValue)
+        invalidateIntrinsicContentSize()
+        onContentSizeMayChange?()
+    }
+
+    override func textDidChange(_ notification: Notification) {
+        super.textDidChange(notification)
+        // Only runs for *committed* text (上屏), not for marked 拼音.
+        let needed = sizeForText(stringValue).width
+        var size = super.intrinsicContentSize
+        size.width = max(editingFloor, needed)
+        lastSize = size
+        invalidateIntrinsicContentSize()
+        onContentSizeMayChange?()
+    }
+
+    override var intrinsicContentSize: NSSize {
+        if isEditing {
+            var size = super.intrinsicContentSize
+            let committed = sizeForText(stringValue).width
+            size.width = max(editingFloor, committed, lastSize?.width ?? editingFloor)
+            return size
+        }
+        return lastSize ?? sizeForText(stringValue)
+    }
+}
+
+/// Empty area after the auto-growing field. Drag moves the panel; click
+/// focuses the search field — same split Spotlight uses.
+private final class NotesSearchDragArea: NSView {
+    var onActivate: (() -> Void)?
+
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .iBeam)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        let start = NSEvent.mouseLocation
+        let origin = window.frame.origin
+        var dragging = false
+        // Bound the tracking loop — a missing mouseUp must not hang forever.
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            guard window.isVisible,
+                  let next = window.nextEvent(
+                    matching: [.leftMouseUp, .leftMouseDragged],
+                    until: deadline,
+                    inMode: .eventTracking,
+                    dequeue: true
+                  ) else { break }
+            if next.type == .leftMouseUp {
+                if !dragging { onActivate?() }
+                break
+            }
+            let now = NSEvent.mouseLocation
+            let dx = now.x - start.x
+            let dy = now.y - start.y
+            if dragging || hypot(dx, dy) >= 4 {
+                dragging = true
+                window.setFrameOrigin(NSPoint(x: origin.x + dx, y: origin.y + dy))
+            }
         }
     }
 }
 
+/// Magnifying-glass that does not steal hits from the header.
+private final class NotesSearchIconView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// Opaque rounded chrome. Vibrancy + WKWebView fights corner clipping and
+/// washes out body text — solid fill keeps both readable and clean.
+private final class NotesPanelChrome: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.cornerRadius = 8
+        if #available(macOS 11.0, *) {
+            layer?.cornerCurve = .continuous
+        }
+        updateFill()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateFill()
+    }
+
+    private func updateFill() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+    }
+}
+
 /// Always-on-top notes browser: query → list → Markdown preview (select/copy),
-/// jumping to the first body match when present.
-final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate {
+/// jumping to the first body match when present. Chrome mirrors Spotlight:
+/// borderless floating panel, custom search row, light status strip.
+final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate {
     private let searchField = NotesSearchField()
     private let tableView = NSTableView()
     private let previewWeb: WKWebView = {
         let w = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
         return w
     }()
-    private let matchCountLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    private let placeholderLabel = NSTextField(labelWithString: "搜索文件名或正文…")
     private var splitView: NSSplitView!
     private var hits: [NoteHit] = []
     private var searchWork: DispatchWorkItem?
@@ -2163,6 +2294,8 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     private var currentQuery = ""
     private var didApplyInitialSplit = false
     private var splitInitRetries = 0
+    /// Per-note match hint folded into the bottom status line.
+    private var matchHint = ""
     /// Last previewed note + query — skip redundant WKWebView reloads.
     private var previewedPath: String?
     private var previewedQuery: String?
@@ -2170,16 +2303,19 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     init() {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 720, height: 440),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+            styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false)
 
-        title = "搜索笔记"
         isFloatingPanel = true
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        isMovableByWindowBackground = true
         minSize = NSSize(width: 520, height: 320)
         setFrameAutosaveName("PromptQyNotesSearchFrame")
         buildContent()
@@ -2190,6 +2326,12 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     override func close() { orderOut(nil) }
 
     override func orderOut(_ sender: Any?) {
+        // End editing so NotesSearchField.isEditing / lastSize reset; otherwise
+        // a later `stringValue = ""` is ignored while isEditing stays true.
+        if searchField.currentEditor() != nil {
+            endEditing(for: searchField)
+        }
+        makeFirstResponder(nil)
         releasePreviewResources()
         super.orderOut(sender)
     }
@@ -2205,7 +2347,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         previewedQuery = nil
         hits = []
         tableView.reloadData()
-        matchCountLabel.stringValue = ""
+        matchHint = ""
         statusLabel.stringValue = ""
         previewWeb.stopLoading()
         previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
@@ -2215,10 +2357,21 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         if !isVisible { center() }
         searchField.stringValue = ""
         runSearch("")
+        // Finish chrome layout before focusing so the first IME keystroke
+        // does not collide with an initial Auto Layout pass.
+        contentView?.layoutSubtreeIfNeeded()
+        applyInitialSplitIfNeeded()
         makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        makeFirstResponder(searchField)
-        applyInitialSplitIfNeeded()
+        // Defer first-responder + input-context activation to the next turn;
+        // synchronous focus on cold launch often eats the first 拼音 letter.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.makeFirstResponder(self.searchField)
+            (self.searchField.currentEditor() as? NSTextView)?.inputContext?.activate()
+            NSTextInputContext.current?.activate()
+            self.updateSearchPlaceholder()
+        }
     }
 
     private func applyInitialSplitIfNeeded() {
@@ -2241,13 +2394,50 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
     }
 
     private func buildContent() {
-        searchField.placeholderString = "搜索文件名或正文…"
-        searchField.sendsSearchStringImmediately = true
-        searchField.sendsWholeSearchString = false
+        let searchIcon = NotesSearchIconView()
+        searchIcon.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "搜索")
+        searchIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        searchIcon.contentTintColor = .secondaryLabelColor
+        searchIcon.translatesAutoresizingMaskIntoConstraints = false
+
         searchField.delegate = self
-        searchField.onMoveUp = { [weak self] in self?.moveSelection(by: -1) }
-        searchField.onMoveDown = { [weak self] in self?.moveSelection(by: 1) }
+        searchField.focusRingType = .none
+        searchField.isBordered = false
+        searchField.isBezeled = false
+        searchField.drawsBackground = false
+        searchField.backgroundColor = .clear
+        searchField.font = .systemFont(ofSize: 15, weight: .regular)
+        searchField.lineBreakMode = .byClipping
+        searchField.cell?.isScrollable = true
+        (searchField.cell as? NSTextFieldCell)?.usesSingleLineMode = true
+        searchField.onContentSizeMayChange = { [weak self] in self?.updateSearchPlaceholder() }
         searchField.translatesAutoresizingMaskIntoConstraints = false
+        // Hug content so empty space is real chrome (Spotlight pattern).
+        searchField.setContentHuggingPriority(.required, for: .horizontal)
+        searchField.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        placeholderLabel.font = .systemFont(ofSize: 15, weight: .regular)
+        placeholderLabel.textColor = .placeholderTextColor
+        placeholderLabel.drawsBackground = false
+        placeholderLabel.isEditable = false
+        placeholderLabel.isSelectable = false
+        placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let dragArea = NotesSearchDragArea()
+        dragArea.translatesAutoresizingMaskIntoConstraints = false
+        dragArea.onActivate = { [weak self] in
+            guard let self else { return }
+            self.makeKeyAndOrderFront(nil)
+            self.makeFirstResponder(self.searchField)
+        }
+
+        // Equal top/bottom padding so the row is vertically centered.
+        let searchHeader = NSView()
+        searchHeader.translatesAutoresizingMaskIntoConstraints = false
+        searchHeader.addSubview(searchIcon)
+        searchHeader.addSubview(placeholderLabel)
+        searchHeader.addSubview(searchField)
+        searchHeader.addSubview(dragArea)
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("note"))
         col.title = "笔记"
@@ -2265,6 +2455,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         tableView.target = self
         tableView.action = #selector(tableClicked)
         tableView.style = .plain
+        tableView.backgroundColor = .clear
         tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         tableView.selectionHighlightStyle = .regular
 
@@ -2273,6 +2464,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         listScroll.hasVerticalScroller = true
         listScroll.borderType = .noBorder
         listScroll.drawsBackground = false
+        listScroll.backgroundColor = .clear
         // Split-view children must use frame-based layout (autoresizingMask).
         // Auto Layout width constraints on them fight the divider and snap back.
         listScroll.translatesAutoresizingMaskIntoConstraints = true
@@ -2281,36 +2473,29 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
 
         previewWeb.navigationDelegate = self
         previewWeb.translatesAutoresizingMaskIntoConstraints = false
+        // Match the opaque panel fill (transparent HTML still used).
+        if #available(macOS 12.0, *) {
+            previewWeb.underPageBackgroundColor = .windowBackgroundColor
+        }
+        previewWeb.setValue(false, forKey: "drawsBackground")
         // Wide HTML tables report a huge intrinsic width; don't let that drive the split.
         previewWeb.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
         previewWeb.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
         previewWeb.setContentHuggingPriority(.defaultLow, for: .vertical)
         previewWeb.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
-        matchCountLabel.font = .systemFont(ofSize: 11)
-        matchCountLabel.textColor = .secondaryLabelColor
-        matchCountLabel.alignment = .left
-        matchCountLabel.lineBreakMode = .byTruncatingTail
-        matchCountLabel.translatesAutoresizingMaskIntoConstraints = false
-        matchCountLabel.stringValue = ""
-        matchCountLabel.setContentHuggingPriority(.required, for: .vertical)
-
         let previewPane = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         previewPane.translatesAutoresizingMaskIntoConstraints = true
+        previewPane.wantsLayer = true
+        previewPane.layer?.backgroundColor = NSColor.clear.cgColor
         previewPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         previewPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         previewPane.addSubview(previewWeb)
-        previewPane.addSubview(matchCountLabel)
         NSLayoutConstraint.activate([
             previewWeb.topAnchor.constraint(equalTo: previewPane.topAnchor),
             previewWeb.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor),
             previewWeb.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor),
-            previewWeb.bottomAnchor.constraint(equalTo: matchCountLabel.topAnchor, constant: -4),
-
-            matchCountLabel.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor, constant: 10),
-            matchCountLabel.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor, constant: -10),
-            matchCountLabel.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor, constant: -6),
-            matchCountLabel.heightAnchor.constraint(equalToConstant: 16),
+            previewWeb.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor),
         ])
 
         let split = NSSplitView()
@@ -2318,6 +2503,8 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         split.dividerStyle = .thin
         split.delegate = self
         split.autosaveName = "PromptQyNotesSplit"
+        split.wantsLayer = true
+        split.layer?.backgroundColor = NSColor.clear.cgColor
         split.addSubview(listScroll)
         split.addSubview(previewPane)
         // List holds its width when the window resizes; preview absorbs the slack.
@@ -2326,31 +2513,85 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         split.translatesAutoresizingMaskIntoConstraints = false
         splitView = split
 
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.font = .systemFont(ofSize: 10, weight: .regular)
+        statusLabel.textColor = .tertiaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.setContentHuggingPriority(.required, for: .vertical)
 
-        let root = NSView()
-        root.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(searchField)
+        let headerSep = NSBox()
+        headerSep.boxType = .separator
+        headerSep.translatesAutoresizingMaskIntoConstraints = false
+
+        let footerSep = NSBox()
+        footerSep.boxType = .separator
+        footerSep.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NotesPanelChrome(frame: NSRect(x: 0, y: 0, width: 720, height: 440))
+        root.autoresizingMask = [.width, .height]
+        root.addSubview(searchHeader)
+        root.addSubview(headerSep)
         root.addSubview(split)
+        root.addSubview(footerSep)
         root.addSubview(statusLabel)
         contentView = root
 
         NSLayoutConstraint.activate([
-            searchField.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            searchField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            searchField.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            searchHeader.topAnchor.constraint(equalTo: root.topAnchor),
+            searchHeader.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            searchHeader.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            searchHeader.heightAnchor.constraint(equalToConstant: 48),
 
-            split.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            searchIcon.leadingAnchor.constraint(equalTo: searchHeader.leadingAnchor, constant: 16),
+            searchIcon.centerYAnchor.constraint(equalTo: searchField.firstBaselineAnchor, constant: -5),
+            searchIcon.widthAnchor.constraint(equalToConstant: 16),
+            searchIcon.heightAnchor.constraint(equalToConstant: 16),
+
+            // Field hugs text; trailing side is the drag area (Spotlight).
+            searchField.leadingAnchor.constraint(equalTo: searchIcon.trailingAnchor, constant: 8),
+            searchField.topAnchor.constraint(equalTo: searchHeader.topAnchor, constant: 14),
+            searchField.bottomAnchor.constraint(equalTo: searchHeader.bottomAnchor, constant: -14),
+            searchField.widthAnchor.constraint(lessThanOrEqualTo: searchHeader.widthAnchor, constant: -80),
+
+            placeholderLabel.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
+            placeholderLabel.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+
+            dragArea.leadingAnchor.constraint(equalTo: searchField.trailingAnchor),
+            dragArea.trailingAnchor.constraint(equalTo: searchHeader.trailingAnchor),
+            dragArea.topAnchor.constraint(equalTo: searchHeader.topAnchor),
+            dragArea.bottomAnchor.constraint(equalTo: searchHeader.bottomAnchor),
+
+            headerSep.topAnchor.constraint(equalTo: searchHeader.bottomAnchor),
+            headerSep.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            headerSep.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+            split.topAnchor.constraint(equalTo: headerSep.bottomAnchor),
             split.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            split.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
+            split.bottomAnchor.constraint(equalTo: footerSep.topAnchor),
 
-            statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            statusLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+            footerSep.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            footerSep.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+            statusLabel.topAnchor.constraint(equalTo: footerSep.bottomAnchor, constant: 4),
+            statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            statusLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
         ])
+    }
+
+    private func refreshStatusLine(emptyMessage: String? = nil) {
+        if let emptyMessage {
+            statusLabel.stringValue = emptyMessage
+            return
+        }
+        guard !hits.isEmpty else {
+            statusLabel.stringValue = ""
+            return
+        }
+        var parts = ["\(hits.count) 条"]
+        if !matchHint.isEmpty { parts.append(matchHint) }
+        parts.append("Esc 关闭")
+        statusLabel.stringValue = parts.joined(separator: " · ")
     }
 
     // MARK: NSSplitViewDelegate
@@ -2375,6 +2616,8 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
 
     func controlTextDidChange(_ obj: Notification) {
         guard obj.object as AnyObject === searchField else { return }
+        updateSearchPlaceholder()
+        // Width refresh is already handled in NotesSearchField.textDidChange.
         let q = searchField.stringValue
         searchWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.runSearch(q) }
@@ -2382,7 +2625,19 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
+    private func updateSearchPlaceholder() {
+        // Only depend on committed text. Do not query hasMarkedText / toggle
+        // visibility during 拼音 — that layout side-effect commits letter 1
+        // when letter 2 is typed.
+        let alpha: CGFloat = searchField.stringValue.isEmpty ? 1 : 0
+        if placeholderLabel.alphaValue != alpha {
+            placeholderLabel.alphaValue = alpha
+        }
+    }
+
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // While 拼音 is composing, let the IME keep arrow / navigation keys.
+        if textView.hasMarkedText() { return false }
         if commandSelector == #selector(NSResponder.moveUp(_:)) {
             moveSelection(by: -1); return true
         }
@@ -2410,15 +2665,15 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
                 if results.isEmpty {
                     self.clearPreview()
                     let exists = FileManager.default.fileExists(atPath: vault)
-                    self.statusLabel.stringValue = exists
+                    self.refreshStatusLine(emptyMessage: exists
                         ? "无匹配结果"
-                        : "笔记库路径不存在：\(vault)"
+                        : "笔记库路径不存在：\(vault)")
                 } else {
                     self.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
                     // selectRowIndexes is a no-op when row 0 was already selected,
                     // so selectionDidChange may not fire — always show once here.
                     self.showPreview(for: 0)
-                    self.statusLabel.stringValue = "\(results.count) 条 · Esc 关闭 · 预览中可框选复制"
+                    self.refreshStatusLine()
                 }
             }
         }
@@ -2443,7 +2698,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         loadToken += 1
         previewedPath = nil
         previewedQuery = nil
-        matchCountLabel.stringValue = ""
+        matchHint = ""
         previewWeb.stopLoading()
         previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
     }
@@ -2467,12 +2722,11 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
         let matchText = MarkdownVault.firstMatch(in: haystack, matching: q)
         let count = MarkdownHTML.matchCount(in: haystack, query: q)
         if q.isEmpty {
-            matchCountLabel.stringValue = ""
+            matchHint = ""
         } else {
-            matchCountLabel.stringValue = count > 0
-                ? "本篇命中 \(count) 处"
-                : "本篇正文无命中（仅文件名匹配）"
+            matchHint = count > 0 ? "本篇 \(count) 处" : "仅文件名"
         }
+        refreshStatusLine()
         pendingJump = matchText
         loadToken += 1
         let token = loadToken
@@ -2497,7 +2751,7 @@ final class NotesSearchPanel: NSPanel, NSSearchFieldDelegate, NSTableViewDataSou
           html, body {
             margin: 0; padding: 0;
             font: 13px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-            background: Canvas;
+            background: transparent;
             color: CanvasText;
           }
           body { padding: 14px 16px 28px; overflow-wrap: anywhere; word-break: break-word; }
