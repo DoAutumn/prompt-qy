@@ -15,6 +15,7 @@
 - **双击 Control 呼出**：若前台有选中文本，自动插入到光标处（先走辅助功能 API，取不到再回退合成 ⌘C）
 - **拖文件进编辑器**：插入文件路径
 - **双击 Option 搜索笔记**（Obsidian 等 Markdown / `.sheet` 表格库）：置顶浮层，Markdown / 表格预览可框选复制并定位到匹配处；库路径与排除目录可在设置中配置
+- **Finder 空格预览**：支持 `.md` / `.markdown` / `.sheet` 渲染预览，缩略图与 `.js` / `.json` 同类白底文本页
 - **双击 Command 用 Sublime Text 打开** Finder 当前选中的文件
 - **截图自动插路径**：⌘⇧4 截图后，把新截图路径插进编辑器（菜单里的「截图后立即插入」可关闭 macOS 悬浮缩略图，让截图即存即插，省去约 5 秒等待）
 - **语音录入**：按住右 Option 开始录音（实时流式识别），松手停止；底部栏有红色脉冲圆点 +「录音中…」指示。识别结果实时出现在编辑器光标位置，松开后自动定稿。基于 macOS 原生 SFSpeechRecognizer，支持中英混合
@@ -82,6 +83,18 @@ cp -R "dist/PromptQy.app" /Applications/   # 安装到应用程序
 
 本地构建的 App **没有 quarantine 标记**，Gatekeeper 不会拦。
 
+## Quick Look（Markdown / `.sheet`）
+
+安装后请**先打开一次 PromptQy**，让系统注册扩展。然后在 Finder 中选中 `.md` / `.markdown` / `.sheet` 文件，按 **空格** 预览。
+
+若空格仍是纯文本（或被其它 Markdown 预览扩展抢走）：
+
+1. 打开 **系统设置 → 通用 → 登录项与扩展 → Quick Look**
+2. 启用 **PromptQy Markdown Preview** 与 **PromptQy Markdown Thumbnail**
+3. 若同时开着其它 Markdown 预览扩展，请关掉它们（同一文件类型只能有一个生效）
+
+空格预览样式跟随浅色/深色外观；双击 Option 的笔记预览使用同一套样式。`.md` / `.markdown` 的 Finder 缩略图走**系统**文本缩略图（与 `.js` / `.json` 同类）；PromptQy 仅为 `.sheet` 提供缩略图。
+
 ## 关于权限
 
 首次使用会弹窗请求（各授权一次即可）：
@@ -103,14 +116,21 @@ tccutil reset AppleEvents io.github.promptqy
 
 | 文件 | 作用 |
 |---|---|
-| `command_bar.swift` | 全部逻辑（单文件） |
-| `build_app.sh` | 编译 + 打包 + 签名成 `.app` |
+| `command_bar.swift` | 菜单栏主程序逻辑 |
+| `Shared/` | Markdown / `.sheet` HTML 与 Quick Look 共用代码 |
+| `MarkdownPreview/` | Finder 空格预览扩展 |
+| `MarkdownThumbnail/` | Finder 缩略图扩展 |
+| `project.yml` | XcodeGen 工程定义 |
+| `PromptQy.xcodeproj` | 由 `build_app.sh` 生成的 Xcode 工程 |
+| `build_app.sh` | `xcodegen` + `xcodebuild` + 签名打包 |
 | `make_zip.sh` | 把构建好的 App 压成 Release 产物 |
 | `release.sh` | 升 `VERSION`、发 Release、同步更新 Homebrew cask |
 | `generate_icon.swift` | 生成 App 图标 |
 | `setup_signing.sh` | 可选的开发者辅助脚本（见下） |
 
-> **需要反复重建？** `swiftc` 产出的 App 没有稳定代码签名，macOS 的隐私系统（TCC）在每次重建后都会重新要辅助功能/自动化授权。跑一次 `./setup_signing.sh` 会新建一个**独立钥匙串**（**不碰**你的登录钥匙串）里的自签名身份，`build_app.sh` 之后就用它签名，授权便能跨重建保留。**下载 Release 安装的普通用户完全不需要这一步。**
+需要 **Xcode**（`xcodebuild`）和 **xcodegen**（`brew install xcodegen`）。
+
+> **需要反复重建？** 没有稳定代码签名时，macOS 的隐私系统（TCC）在每次重建后都会重新要辅助功能/自动化授权。跑一次 `./setup_signing.sh` 会新建一个**独立钥匙串**（**不碰**你的登录钥匙串）里的自签名身份，`build_app.sh` 之后就用它签名，授权便能跨重建保留。**下载 Release 安装的普通用户完全不需要这一步。**
 
 ## License
 

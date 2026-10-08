@@ -1,82 +1,103 @@
 #!/bin/bash
-# Build "PromptQy.app" — an LSUIElement (no Dock) menu-bar app that
-# hosts the always-on-top composer. Mirrors the build form of the sibling
-# claude-desktop-usage project.
+# Build PromptQy.app (menu-bar host + Quick Look Preview/Thumbnail extensions).
+# Entry point for Agent / CI — generates Xcode project via xcodegen, then xcodebuild.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="PromptQy"
+VERSION="$(cat "$ROOT/VERSION")"
+DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"
+DERIVED="$ROOT/dist/DerivedData"
 APP="$ROOT/dist/$APP_NAME.app"
 ICONSET="$ROOT/dist/icon.iconset"
-# Single source of truth for the version; release.sh bumps it and keeps the git
-# tag, the GitHub release and the Homebrew cask in sync with it.
-VERSION="$(cat "$ROOT/VERSION")"
 
-echo "==> Cleaning $APP"
-rm -rf "$APP" "$ICONSET"
-mkdir -p "$APP/Contents/MacOS"
-mkdir -p "$APP/Contents/Resources"
+command -v xcodegen >/dev/null || {
+    echo "!! xcodegen not found — install with: brew install xcodegen" >&2
+    exit 1
+}
+command -v xcodebuild >/dev/null || {
+    echo "!! xcodebuild not found — install Xcode / CLT" >&2
+    exit 1
+}
 
-echo "==> Generating app icon (iconset → icns)"
+echo "==> Version $VERSION (macOS $DEPLOYMENT_TARGET)"
+rm -rf "$APP" "$ICONSET" "$DERIVED"
+mkdir -p "$ROOT/dist" "$ROOT/App"
+
+echo "==> Generating AppIcon.icns"
 mkdir -p "$ICONSET"
 swift "$ROOT/generate_icon.swift" "$ICONSET"
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+iconutil -c icns "$ICONSET" -o "$ROOT/App/AppIcon.icns"
 rm -rf "$ICONSET"
 
-echo "==> Installing menu-bar template icon"
-# Hand-designed template (black-on-transparent); see assets/MenuBarIcon*.png
-cp "$ROOT/assets/MenuBarIcon.png" "$ROOT/assets/MenuBarIcon@2x.png" \
-    "$APP/Contents/Resources/"
+echo "==> Generating Xcode project"
+(cd "$ROOT" && xcodegen generate)
 
-echo "==> Compiling Swift binary"
-# Pin the deployment target so the Mach-O runs on older macOS (see sibling repo).
-DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-11.0}"
-swiftc -O -target "$(uname -m)-apple-macos${DEPLOYMENT_TARGET}" \
-    -framework Cocoa -framework ApplicationServices -framework Speech \
-    -framework AVFoundation -framework WebKit \
-    -o "$APP/Contents/MacOS/PromptQy" "$ROOT/command_bar.swift"
+echo "==> Building with xcodebuild"
+ARCH="$(uname -m)"
+# Do not pass MACOSX_DEPLOYMENT_TARGET here — it overrides every target and
+# breaks MarkdownPreview (needs 12.0 for QLPreviewProvider). Per-target
+# versions live in project.yml.
+xcodebuild \
+    -project "$ROOT/PromptQy.xcodeproj" \
+    -scheme PromptQy \
+    -configuration Release \
+    -derivedDataPath "$DERIVED" \
+    -destination "platform=macOS,arch=${ARCH}" \
+    ARCHS="$ARCH" \
+    ONLY_ACTIVE_ARCH=YES \
+    MARKETING_VERSION="$VERSION" \
+    CURRENT_PROJECT_VERSION="$VERSION" \
+    CODE_SIGN_IDENTITY="-" \
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGNING_REQUIRED=NO \
+    build
 
-echo "==> Writing Info.plist (version $VERSION)"
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>            <string>PromptQy</string>
-    <key>CFBundleDisplayName</key>     <string>PromptQy</string>
-    <key>CFBundleIdentifier</key>      <string>io.github.promptqy</string>
-    <key>CFBundleExecutable</key>      <string>PromptQy</string>
-    <key>CFBundleVersion</key>         <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
-    <key>CFBundlePackageType</key>     <string>APPL</string>
-    <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleIconName</key>        <string>AppIcon</string>
-    <key>LSUIElement</key>             <true/>
-    <key>NSAppleEventsUsageDescription</key> <string>控制 Finder 与终端（终端.app / iTerm2 / Otty），以插入文件路径、把内容发送到终端并执行。</string>
-    <key>NSSpeechRecognitionUsageDescription</key> <string>语音识别用于将口述内容实时转写并录入编辑器。</string>
-    <key>NSMicrophoneUsageDescription</key> <string>麦克风仅在按住语音键录音时使用，用于将口述内容转写为文字。</string>
-    <key>LSMinimumSystemVersion</key>  <string>11.0</string>
-    <key>NSHighResolutionCapable</key> <true/>
-    <key>NSHumanReadableCopyright</key> <string>Personal tool. Not an Anthropic product.</string>
-</dict>
-</plist>
-PLIST
+BUILT="$DERIVED/Build/Products/Release/$APP_NAME.app"
+[ -d "$BUILT" ] || { echo "!! build product missing: $BUILT" >&2; exit 1; }
+rm -rf "$APP"
+cp -R "$BUILT" "$APP"
 
 # Prefer a stable self-signed identity (see setup_signing.sh) so TCC grants
-# (Accessibility/Automation) survive rebuilds; fall back to ad-hoc otherwise.
+# survive rebuilds; fall back to ad-hoc otherwise. Sign nested appexes first.
+sign_identity="-"
+keychain_args=()
 CERT_NAME="PromptQy Dev"
 DEV_KEYCHAIN="$HOME/Library/Keychains/promptqy-dev.keychain-db"
 if security find-certificate -c "$CERT_NAME" "$DEV_KEYCHAIN" >/dev/null 2>&1; then
     echo "==> Code signing with stable identity: $CERT_NAME"
     security unlock-keychain -p "promptqy-dev" "$DEV_KEYCHAIN" 2>/dev/null || true
-    codesign --force --keychain "$DEV_KEYCHAIN" --sign "$CERT_NAME" "$APP"
+    sign_identity="$CERT_NAME"
+    keychain_args=(--keychain "$DEV_KEYCHAIN")
 else
     echo "==> Code signing (ad-hoc; run ./setup_signing.sh for a stable identity)"
-    codesign --force --sign - "$APP"
 fi
+
+PLUGINS="$APP/Contents/PlugIns"
+if [ -d "$PLUGINS/MarkdownPreview.appex" ]; then
+    echo "==> Signing MarkdownPreview.appex"
+    codesign --force --sign "$sign_identity" "${keychain_args[@]}" \
+        --entitlements "$ROOT/MarkdownPreview/MarkdownPreview.entitlements" \
+        "$PLUGINS/MarkdownPreview.appex"
+fi
+if [ -d "$PLUGINS/MarkdownThumbnail.appex" ]; then
+    echo "==> Signing MarkdownThumbnail.appex"
+    codesign --force --sign "$sign_identity" "${keychain_args[@]}" \
+        --entitlements "$ROOT/MarkdownThumbnail/MarkdownThumbnail.entitlements" \
+        "$PLUGINS/MarkdownThumbnail.appex"
+fi
+
+echo "==> Signing $APP_NAME.app"
+codesign --force --sign "$sign_identity" "${keychain_args[@]}" "$APP"
 codesign -dvv "$APP" 2>&1 | grep -E "Identifier|Authority|Signature" || true
+
+echo "==> PlugIns:"
+ls -la "$PLUGINS" 2>/dev/null || echo "(none)"
 
 echo "==> Done: $APP"
 echo
 echo "Run with:    open \"$APP\""
-echo "Install via: cp -R \"$APP\" /Applications/"
+echo "Install via: rm -rf /Applications/PromptQy.app && cp -R \"$APP\" /Applications/"
+echo "  (must replace, not merge — a merge leaves stale Resources and breaks codesign)"
+echo "Then enable Quick Look extensions if needed:"
+echo "  System Settings → General → Login Items & Extensions → Quick Look"

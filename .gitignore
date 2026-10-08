@@ -1,2 +1,6 @@
 .DS_Store
 dist/
+App/AppIcon.icns
+**/xcuserdata/
+*.xcuserstate
+.swiftpm/

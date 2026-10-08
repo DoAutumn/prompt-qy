@@ -980,10 +980,11 @@ final class DoubleTapMonitor {
 /// Thin wrapper around SFSpeechRecognizer + AVAudioEngine for real-time,
 /// streaming dictation. Supports push-to-talk via partial/final callbacks.
 final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
-    private let speechRecognizer: SFSpeechRecognizer
+    private let speechRecognizer: SFSpeechRecognizer?
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var tapInstalled = false
 
     /// Called on the main thread with partial (in-progress) transcription.
     var onPartialResult: ((String) -> Void)?
@@ -997,9 +998,9 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     var isRecording: Bool { audioEngine.isRunning }
 
     init(locale: Locale = Locale(identifier: "zh-CN")) {
-        speechRecognizer = SFSpeechRecognizer(locale: locale)!
+        speechRecognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer()
         super.init()
-        speechRecognizer.delegate = self
+        speechRecognizer?.delegate = self
     }
 
     /// Request speech-recognition authorization. Must be called before recording.
@@ -1018,29 +1019,27 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     }
 
     func startRecording() throws {
-        // Cancel any previous task
+        guard let speechRecognizer else {
+            throw NSError(domain: "VoiceRecognizer", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "当前系统不支持语音识别"])
+        }
+
+        // Cancel any previous task and leftover tap (e.g. after a failed start).
         recognitionTask?.cancel()
         recognitionTask = nil
+        removeTapIfNeeded()
 
         // Tapping inputNode triggers the system microphone permission prompt.
         let inputNode = audioEngine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         // Create a fresh recognition request
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else {
-            throw NSError(domain: "VoiceRecognizer", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "无法创建语音识别请求"])
-        }
-        recognitionRequest.shouldReportPartialResults = true
-        // Disable automatic punctuation on macOS — Chinese output often
-        // inserts unwanted full-width punctuation mid-phrase.
-        if #available(macOS 15, *) {
-            // macOS 15 added taskHint; default (.unspecified) is fine.
-        }
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        recognitionRequest = request
 
         recognitionTask = speechRecognizer.recognitionTask(
-            with: recognitionRequest
+            with: request
         ) { [weak self] result, error in
             guard let self = self else { return }
             if let error = error {
@@ -1062,15 +1061,25 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
                              format: recordingFormat) { [weak self] buffer, _ in
             self?.recognitionRequest?.append(buffer)
         }
+        tapInstalled = true
 
-        audioEngine.prepare()
-        try audioEngine.start()
-        onStateChange?(true)
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            onStateChange?(true)
+        } catch {
+            // start() failed — tear down the tap so the next attempt can install.
+            removeTapIfNeeded()
+            self.recognitionRequest = nil
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            throw error
+        }
     }
 
     func stopRecording() {
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if audioEngine.isRunning { audioEngine.stop() }
+        removeTapIfNeeded()
         recognitionRequest?.endAudio()
         recognitionRequest = nil
         // Don't cancel the task — let it deliver final results.
@@ -1081,19 +1090,27 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     func cancel() {
         recognitionTask?.cancel()
         recognitionTask = nil
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
+        if audioEngine.isRunning { audioEngine.stop() }
+        removeTapIfNeeded()
         recognitionRequest = nil
         onStateChange?(false)
+    }
+
+    private func removeTapIfNeeded() {
+        guard tapInstalled else { return }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
     }
 
     // MARK: SFSpeechRecognizerDelegate
 
     func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer,
                           availabilityDidChange available: Bool) {
-        if !available { onError?("语音识别服务暂不可用") }
+        if !available {
+            DispatchQueue.main.async { [weak self] in
+                self?.onError?("语音识别服务暂不可用")
+            }
+        }
     }
 }
 
@@ -1171,6 +1188,14 @@ final class EditorPanel: NSPanel {
     /// ⌘W (and the red traffic-light) should hide, not destroy — the panel is
     /// reused across summons (`isReleasedWhenClosed = false`).
     override func close() { orderOut(nil) }
+
+    override func orderOut(_ sender: Any?) {
+        // Esc / ⌘W while holding the dictation key must not leave the mic open.
+        voiceRecognizer.cancel()
+        dictationPendingRange = nil
+        updateRecordingIndicator(false)
+        super.orderOut(sender)
+    }
 
     private func buildContent() {
         let container = NSView()
@@ -1604,7 +1629,7 @@ struct NoteHit {
 /// Scans an Obsidian vault for `.md` and `.sheet` (Spreadsheets plugin) files.
 /// Fine for ~hundreds of notes — no persistent index.
 enum MarkdownVault {
-    private static let noteExtensions: Set<String> = ["md", "sheet"]
+    private static let noteExtensions: Set<String> = ["md", "markdown", "sheet"]
 
     static func search(query: String) -> [NoteHit] {
         let root = URL(fileURLWithPath: Settings.notesVaultPath, isDirectory: true)
@@ -1703,429 +1728,7 @@ enum MarkdownVault {
     }
 }
 
-/// Obsidian Spreadsheets (`.sheet` / Luckysheet JSON) → searchable text + HTML table.
-enum SheetHTML {
-    static func searchableText(from json: String) -> String {
-        guard let sheets = parseSheets(json) else { return "" }
-        var parts: [String] = []
-        for sheet in sheets {
-            if let name = sheet["name"] as? String, !name.isEmpty {
-                parts.append(name)
-            }
-            for cell in (sheet["celldata"] as? [[String: Any]]) ?? [] {
-                let text = cellDisplayText(cell["v"]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty { parts.append(text) }
-            }
-        }
-        return parts.joined(separator: "\n")
-    }
-
-    static func render(_ json: String) -> String {
-        guard let sheets = parseSheets(json) else {
-            return "<p>无法解析表格文件</p>"
-        }
-        if sheets.isEmpty { return "<p>（空表格）</p>" }
-        var html: [String] = []
-        for sheet in sheets {
-            let name = (sheet["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !name.isEmpty {
-                html.append("<h2>\(MarkdownHTMLEscape.escape(name))</h2>")
-            }
-            html.append(renderTable(celldata: (sheet["celldata"] as? [[String: Any]]) ?? []))
-        }
-        return html.joined(separator: "\n")
-    }
-
-    private static func parseSheets(_ json: String) -> [[String: Any]]? {
-        guard let data = json.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        if let arr = root as? [[String: Any]] { return arr }
-        if let dict = root as? [String: Any] { return [dict] }
-        return nil
-    }
-
-    private static func cellDisplayText(_ v: Any?) -> String {
-        guard let dict = v as? [String: Any] else {
-            if let s = v as? String { return s }
-            if let n = v as? NSNumber { return n.stringValue }
-            return ""
-        }
-        if let m = dict["m"] as? String, !m.isEmpty { return m }
-        if let ct = dict["ct"] as? [String: Any],
-           let t = ct["t"] as? String,
-           t == "inlineStr",
-           let spans = ct["s"] as? [[String: Any]] {
-            return spans.compactMap { $0["v"] as? String }.joined()
-        }
-        if let s = dict["v"] as? String { return s }
-        if let n = dict["v"] as? NSNumber { return n.stringValue }
-        return ""
-    }
-
-    private struct GridCell {
-        var text: String
-        var rowspan: Int
-        var colspan: Int
-        var bg: String?
-    }
-
-    private static func renderTable(celldata: [[String: Any]]) -> String {
-        guard !celldata.isEmpty else { return "<p>（空表格）</p>" }
-
-        var grid: [String: GridCell] = [:]
-        var covered = Set<String>()
-        var maxR = 0
-        var maxC = 0
-        var minR = Int.max
-        var minC = Int.max
-
-        for item in celldata {
-            guard let r = intValue(item["r"]), let c = intValue(item["c"]) else { continue }
-            let v = item["v"] as? [String: Any]
-            let text = cellDisplayText(item["v"])
-            var rowspan = 1
-            var colspan = 1
-            if let mc = v?["mc"] as? [String: Any] {
-                rowspan = max(1, intValue(mc["rs"]) ?? 1)
-                colspan = max(1, intValue(mc["cs"]) ?? 1)
-            }
-            let bg = (v?["bg"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let key = "\(r),\(c)"
-            grid[key] = GridCell(text: text, rowspan: rowspan, colspan: colspan, bg: bg)
-            if rowspan > 1 || colspan > 1 {
-                for rr in r..<(r + rowspan) {
-                    for cc in c..<(c + colspan) {
-                        if rr == r && cc == c { continue }
-                        covered.insert("\(rr),\(cc)")
-                    }
-                }
-            }
-            maxR = max(maxR, r + rowspan - 1)
-            maxC = max(maxC, c + colspan - 1)
-            minR = min(minR, r)
-            minC = min(minC, c)
-        }
-
-        guard minR != Int.max, minC != Int.max else { return "<p>（空表格）</p>" }
-
-        var rows: [String] = []
-        for r in minR...maxR {
-            var cells: [String] = []
-            for c in minC...maxC {
-                let key = "\(r),\(c)"
-                if covered.contains(key) { continue }
-                let cell = grid[key] ?? GridCell(text: "", rowspan: 1, colspan: 1, bg: nil)
-                let tag = (r == minR) ? "th" : "td"
-                var attrs = ""
-                if cell.rowspan > 1 { attrs += " rowspan=\"\(cell.rowspan)\"" }
-                if cell.colspan > 1 { attrs += " colspan=\"\(cell.colspan)\"" }
-                if let bg = cell.bg, isSafeCSSColor(bg) {
-                    attrs += " style=\"background:\(bg)\""
-                }
-                let htmlText = MarkdownHTMLEscape.escape(cell.text)
-                    .replacingOccurrences(of: "\r\n", with: "\n")
-                    .replacingOccurrences(of: "\r", with: "\n")
-                    .replacingOccurrences(of: "\n", with: "<br>")
-                cells.append("<\(tag)\(attrs)>\(htmlText)</\(tag)>")
-            }
-            if !cells.isEmpty {
-                rows.append("<tr>\(cells.joined())</tr>")
-            }
-        }
-        return "<table>\(rows.joined())</table>"
-    }
-
-    private static func intValue(_ any: Any?) -> Int? {
-        if let i = any as? Int { return i }
-        if let n = any as? NSNumber { return n.intValue }
-        if let s = any as? String { return Int(s) }
-        return nil
-    }
-
-    /// Only allow simple hex / rgb colors from the sheet JSON into inline style.
-    private static func isSafeCSSColor(_ s: String) -> Bool {
-        let t = s.lowercased()
-        if t.hasPrefix("#") {
-            let hex = t.dropFirst()
-            return (hex.count == 3 || hex.count == 6 || hex.count == 8)
-                && hex.allSatisfy { $0.isHexDigit }
-        }
-        return t.hasPrefix("rgb(") || t.hasPrefix("rgba(")
-    }
-}
-
-/// Lightweight Markdown → HTML for the notes preview. Covers the Obsidian basics
-/// (headings, emphasis, code, lists, links, wikilinks) and passes through raw
-/// HTML blocks (Obsidian often stores tables as `<table>…</table>`).
-enum MarkdownHTML {
-    static func render(_ markdown: String) -> String {
-        var text = markdown.replacingOccurrences(of: "\r\n", with: "\n")
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Whole-note HTML (e.g. Obsidian HTML tables) — don't escape tags.
-        if trimmed.hasPrefix("<") {
-            return stripScripts(text)
-        }
-
-        var fences: [String] = []
-        text = replaceFences(in: text, store: &fences)
-
-        var html: [String] = []
-        var listKind: String? = nil  // "ul" | "ol"
-        var para: [String] = []
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var i = 0
-
-        func flushPara() {
-            guard !para.isEmpty else { return }
-            // Obsidian-style hard breaks. Inline each line first — joining with
-            // "<br>" before escape() would turn the tag into literal text.
-            let body = para.map { inline($0) }.joined(separator: "<br>")
-            html.append("<p>" + body + "</p>")
-            para.removeAll()
-        }
-        func flushList() {
-            if let k = listKind {
-                html.append("</\(k)>")
-                listKind = nil
-            }
-        }
-
-        while i < lines.count {
-            let line = lines[i]
-            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-
-            if trimmedLine.isEmpty {
-                flushPara()
-                flushList()
-                i += 1
-                continue
-            }
-
-            // Raw HTML block (table / div / …) — Obsidian embeds these as-is.
-            if let tag = htmlBlockTag(trimmedLine) {
-                flushPara()
-                flushList()
-                var block = [line]
-                let close = "</\(tag)>"
-                if !trimmedLine.lowercased().contains(close) && !isVoidHTMLTag(tag) {
-                    i += 1
-                    while i < lines.count {
-                        block.append(lines[i])
-                        if lines[i].lowercased().contains(close) { break }
-                        i += 1
-                    }
-                }
-                html.append(stripScripts(block.joined(separator: "\n")))
-                i += 1
-                continue
-            }
-
-            if let fenceIdx = fencePlaceholderIndex(trimmedLine) {
-                flushPara()
-                flushList()
-                html.append("<pre><code>\(fences[fenceIdx])</code></pre>")
-                i += 1
-                continue
-            }
-
-            if let heading = heading(trimmedLine) {
-                flushPara()
-                flushList()
-                html.append(heading)
-                i += 1
-                continue
-            }
-
-            if let m = trimmedLine.range(of: #"^[-*+]\s+"#, options: .regularExpression) {
-                flushPara()
-                if listKind != "ul" {
-                    flushList()
-                    html.append("<ul>")
-                    listKind = "ul"
-                }
-                let item = String(trimmedLine[m.upperBound...])
-                html.append("<li>\(inline(item))</li>")
-                i += 1
-                continue
-            }
-            if let m = trimmedLine.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
-                flushPara()
-                if listKind != "ol" {
-                    flushList()
-                    html.append("<ol>")
-                    listKind = "ol"
-                }
-                let item = String(trimmedLine[m.upperBound...])
-                html.append("<li>\(inline(item))</li>")
-                i += 1
-                continue
-            }
-            if trimmedLine.hasPrefix("> ") || trimmedLine == ">" {
-                flushPara()
-                flushList()
-                let quote = trimmedLine.hasPrefix("> ") ? String(trimmedLine.dropFirst(2)) : ""
-                html.append("<blockquote><p>\(inline(quote))</p></blockquote>")
-                i += 1
-                continue
-            }
-            if trimmedLine.hasPrefix("---") && trimmedLine.allSatisfy({ $0 == "-" || $0 == " " }) {
-                flushPara()
-                flushList()
-                html.append("<hr>")
-                i += 1
-                continue
-            }
-
-            flushList()
-            para.append(trimmedLine)
-            i += 1
-        }
-        flushPara()
-        flushList()
-        return html.joined(separator: "\n")
-    }
-
-    /// Count non-overlapping case-insensitive occurrences of `query` in `body`.
-    /// For HTML notes, tags are stripped so the count matches visible text.
-    static func matchCount(in body: String, query: String) -> Int {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return 0 }
-        let haystack: String
-        if body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
-            haystack = body.replacingOccurrences(
-                of: #"<[^>]+>"#, with: " ", options: .regularExpression)
-        } else {
-            haystack = body
-        }
-        let lower = haystack.lowercased()
-        let n = needle.lowercased()
-        var count = 0
-        var start = lower.startIndex
-        while let r = lower.range(of: n, range: start..<lower.endIndex) {
-            count += 1
-            start = r.upperBound
-        }
-        return count
-    }
-
-    private static func htmlBlockTag(_ line: String) -> String? {
-        // Match opening tags Obsidian commonly embeds as whole blocks.
-        let pattern = #"^<(table|div|section|article|details|aside|figure|blockquote|ul|ol|pre|iframe|p)\b"#
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
-              let m = re.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)),
-              m.numberOfRanges > 1 else { return nil }
-        return (line as NSString).substring(with: m.range(at: 1)).lowercased()
-    }
-
-    private static func isVoidHTMLTag(_ tag: String) -> Bool {
-        ["br", "hr", "img", "input", "meta", "link"].contains(tag)
-    }
-
-    private static func stripScripts(_ html: String) -> String {
-        guard let re = try? NSRegularExpression(
-            pattern: #"<script\b[^>]*>[\s\S]*?</script>"#,
-            options: [.caseInsensitive]) else { return html }
-        let ns = html as NSString
-        return re.stringByReplacingMatches(
-            in: html, range: NSRange(location: 0, length: ns.length), withTemplate: "")
-    }
-
-    private static func replaceFences(in text: String, store: inout [String]) -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var out: [String] = []
-        var i = 0
-        while i < lines.count {
-            if lines[i].hasPrefix("```") {
-                var code: [String] = []
-                i += 1
-                while i < lines.count && !lines[i].hasPrefix("```") {
-                    code.append(lines[i])
-                    i += 1
-                }
-                store.append(escape(code.joined(separator: "\n")))
-                out.append("%%FENCE\(store.count - 1)%%")
-                if i < lines.count { i += 1 }
-                continue
-            }
-            out.append(lines[i])
-            i += 1
-        }
-        return out.joined(separator: "\n")
-    }
-
-    private static func fencePlaceholderIndex(_ line: String) -> Int? {
-        guard line.hasPrefix("%%FENCE"), line.hasSuffix("%%") else { return nil }
-        let inner = line.dropFirst(7).dropLast(2)
-        return Int(inner)
-    }
-
-    private static func heading(_ line: String) -> String? {
-        var n = 0
-        for ch in line {
-            if ch == "#" { n += 1 } else { break }
-        }
-        guard (1...6).contains(n) else { return nil }
-        let rest = line.dropFirst(n)
-        guard rest.first == " " || rest.isEmpty else { return nil }
-        let title = rest.drop(while: { $0 == " " })
-        return "<h\(n)>\(inline(String(title)))</h\(n)>"
-    }
-
-    private static func inline(_ s: String) -> String {
-        var t = escape(s)
-        // Wikilinks [[note]] / [[note|label]]
-        t = replace(t, pattern: #"\[\[([^\]|]+)\|([^\]]+)\]\]"#) { "<span class=\"wiki\">\($0[2])</span>" }
-        t = replace(t, pattern: #"\[\[([^\]]+)\]\]"#) { "<span class=\"wiki\">\($0[1])</span>" }
-        // Links [text](url)
-        t = replace(t, pattern: #"\[([^\]]+)\]\(([^)]+)\)"#) {
-            "<a href=\"\($0[2])\">\($0[1])</a>"
-        }
-        // Inline code
-        t = replace(t, pattern: #"`([^`]+)`"#) { "<code>\($0[1])</code>" }
-        // Strikethrough ~~ ~~
-        t = replace(t, pattern: #"~~([^~]+)~~"#) { "<del>\($0[1])</del>" }
-        // Bold ** ** / __ __
-        t = replace(t, pattern: #"\*\*([^*]+)\*\*"#) { "<strong>\($0[1])</strong>" }
-        t = replace(t, pattern: #"__([^_]+)__"#) { "<strong>\($0[1])</strong>" }
-        // Italic: only when * / _ are flanked by word boundaries — avoid
-        // mangling shell globs (`du -sh *`) and identifiers (`current_user`).
-        t = replace(t, pattern: #"(?<!\w)\*([^*]+)\*(?!\w)"#) { "<em>\($0[1])</em>" }
-        t = replace(t, pattern: #"(?<!\w)_([^_]+)_(?!\w)"#) { "<em>\($0[1])</em>" }
-        return t
-    }
-
-    private static func replace(
-        _ input: String,
-        pattern: String,
-        _ build: ([String]) -> String
-    ) -> String {
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return input }
-        let ns = input as NSString
-        let matches = re.matches(in: input, range: NSRange(location: 0, length: ns.length))
-        guard !matches.isEmpty else { return input }
-        var out = ""
-        var cursor = 0
-        for m in matches {
-            let full = m.range
-            out += ns.substring(with: NSRange(location: cursor, length: full.location - cursor))
-            var groups = [ns.substring(with: full)]
-            for i in 1..<m.numberOfRanges {
-                let r = m.range(at: i)
-                groups.append(r.location == NSNotFound ? "" : ns.substring(with: r))
-            }
-            out += build(groups)
-            cursor = full.location + full.length
-        }
-        out += ns.substring(from: cursor)
-        return out
-    }
-
-    private static func escape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-    }
-}
+// SheetHTML + MarkdownHTML live in Shared/ (also used by Quick Look extensions).
 
 // MARK: - Notes search panel (Spotlight-like)
 
@@ -2289,7 +1892,8 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     private var hits: [NoteHit] = []
     private var searchWork: DispatchWorkItem?
     private var searchGeneration = 0
-    private var pendingJump: String?
+    /// Jump text tied to the load that produced the current document.
+    private var pendingJump: (token: Int, text: String?)?
     private var loadToken = 0
     private var currentQuery = ""
     private var didApplyInitialSplit = false
@@ -2350,7 +1954,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         matchHint = ""
         statusLabel.stringValue = ""
         previewWeb.stopLoading()
-        previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        previewWeb.loadHTMLString("<html><body style='background:transparent'></body></html>", baseURL: nil)
     }
 
     func showAndFocus() {
@@ -2478,6 +2082,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
             previewWeb.underPageBackgroundColor = .windowBackgroundColor
         }
         previewWeb.setValue(false, forKey: "drawsBackground")
+        // Keep JS for pqJumpTo; navigations are gated in decidePolicyFor.
         // Wide HTML tables report a huge intrinsic width; don't let that drive the split.
         previewWeb.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
         previewWeb.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
@@ -2700,7 +2305,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         previewedQuery = nil
         matchHint = ""
         previewWeb.stopLoading()
-        previewWeb.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        previewWeb.loadHTMLString("<html><body style='background:transparent'></body></html>", baseURL: nil)
     }
 
     private func showPreview(for row: Int) {
@@ -2715,153 +2320,58 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         previewedPath = path
         previewedQuery = q
 
-        // Load body only for the selected note.
-        let body = hit.loadBody()
-        let isSheet = hit.url.pathExtension.lowercased() == "sheet"
-        let haystack = isSheet ? SheetHTML.searchableText(from: body) : body
-        let matchText = MarkdownVault.firstMatch(in: haystack, matching: q)
-        let count = MarkdownHTML.matchCount(in: haystack, query: q)
-        if q.isEmpty {
-            matchHint = ""
-        } else {
-            matchHint = count > 0 ? "本篇 \(count) 处" : "仅文件名"
-        }
-        refreshStatusLine()
-        pendingJump = matchText
         loadToken += 1
         let token = loadToken
-        let bodyHTML = isSheet ? SheetHTML.render(body) : MarkdownHTML.render(body)
-        let page = Self.wrapHTML(bodyHTML, title: hit.title)
-        // Defer load slightly so rapid ↑↓ doesn't race unfinished navigations.
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, token == self.loadToken else { return }
-            self.previewWeb.loadHTMLString(page, baseURL: hit.url.deletingLastPathComponent())
-        }
-    }
+        pendingJump = (token, nil)
 
-    private static func wrapHTML(_ body: String, title: String) -> String {
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <title>\(MarkdownHTMLEscape.escape(title))</title>
-        <style>
-          :root { color-scheme: light dark; }
-          html, body {
-            margin: 0; padding: 0;
-            font: 13px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-            background: transparent;
-            color: CanvasText;
-          }
-          body { padding: 14px 16px 28px; overflow-wrap: anywhere; word-break: break-word; }
-          h1,h2,h3,h4,h5,h6 { line-height: 1.25; margin: 1.1em 0 0.4em; }
-          h1 { font-size: 1.45em; } h2 { font-size: 1.25em; } h3 { font-size: 1.1em; }
-          p, ul, ol, blockquote, pre { margin: 0.55em 0; }
-          p { white-space: normal; }
-          ul, ol { padding-left: 1.4em; }
-          code, pre {
-            font-family: ui-monospace, Menlo, monospace;
-            font-size: 0.92em;
-          }
-          code {
-            background: rgba(127,127,127,0.15);
-            padding: 0.1em 0.35em;
-            border-radius: 3px;
-          }
-          pre {
-            background: rgba(127,127,127,0.12);
-            padding: 10px 12px;
-            border-radius: 6px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-          }
-          pre code { background: none; padding: 0; }
-          blockquote {
-            margin-left: 0; padding: 0.2em 0.8em;
-            border-left: 3px solid rgba(127,127,127,0.45);
-            color: gray;
-          }
-          table {
-            border-collapse: collapse;
-            width: 100%;
-            font-size: 12px;
-            margin: 0.4em 0 1em;
-          }
-          th, td {
-            border: 1px solid rgba(127,127,127,0.35);
-            padding: 6px 8px;
-            vertical-align: top;
-            text-align: left;
-            overflow-wrap: anywhere;
-            word-break: break-word;
-          }
-          th { background: rgba(127,127,127,0.12); font-weight: 600; }
-          a { color: #0a84ff; }
-          .wiki {
-            color: #0a84ff;
-            border-bottom: 1px dashed rgba(10,132,255,0.5);
-          }
-          hr { border: none; border-top: 1px solid rgba(127,127,127,0.35); margin: 1em 0; }
-          mark.pq-hit {
-            background: #ffe58a;
-            color: inherit;
-            padding: 0 1px;
-            border-radius: 2px;
-          }
-          @media (prefers-color-scheme: dark) {
-            mark.pq-hit { background: #8a6d1a; color: #fff8d6; }
-            a, .wiki { color: #64b5ff; }
-            th { background: rgba(255,255,255,0.08); }
-          }
-        </style>
-        </head>
-        <body>
-        <article>\(body)</article>
-        <script>
-        window.pqJumpTo = function(q) {
-          if (!q) { window.scrollTo(0, 0); return; }
-          document.querySelectorAll('mark.pq-hit').forEach(function(m) {
-            m.replaceWith(document.createTextNode(m.textContent || ''));
-          });
-          var needle = q.toLowerCase();
-          var first = null;
-          function highlightNode(node) {
-            var text = node.nodeValue || '';
-            var lower = text.toLowerCase();
-            var idx = lower.indexOf(needle);
-            if (idx < 0) return false;
-            var frag = document.createDocumentFragment();
-            var cursor = 0;
-            while (idx >= 0) {
-              if (idx > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, idx)));
-              var mark = document.createElement('mark');
-              mark.className = 'pq-hit';
-              mark.textContent = text.slice(idx, idx + q.length);
-              frag.appendChild(mark);
-              if (!first) first = mark;
-              cursor = idx + q.length;
-              idx = lower.indexOf(needle, cursor);
+        // Read + render off the main thread so large notes don't hitch ↑↓.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let body = hit.loadBody()
+            let isSheet = hit.url.pathExtension.lowercased() == "sheet"
+            let rawHaystack = isSheet ? SheetHTML.searchableText(from: body) : body
+            let haystack = isSheet ? rawHaystack : MarkdownHTML.searchHaystack(from: rawHaystack)
+            let matchText = MarkdownVault.firstMatch(in: haystack, matching: q)
+            let count = MarkdownHTML.matchCount(in: haystack, query: q)
+            let bodyHTML = isSheet ? SheetHTML.render(body) : MarkdownHTML.render(body)
+            let page = DocumentPreviewPage.wrap(
+                bodyHTML: bodyHTML, title: hit.title,
+                includeSearchJump: true, chrome: .panel)
+            let base = hit.url.deletingLastPathComponent()
+            DispatchQueue.main.async {
+                guard let self = self, token == self.loadToken else { return }
+                if q.isEmpty {
+                    self.matchHint = ""
+                } else {
+                    self.matchHint = count > 0 ? "本篇 \(count) 处" : "仅文件名"
+                }
+                self.refreshStatusLine()
+                self.pendingJump = (token, matchText)
+                self.previewWeb.loadHTMLString(page, baseURL: base)
             }
-            if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
-            node.parentNode.replaceChild(frag, node);
-            return true;
-          }
-          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-          var nodes = [];
-          while (walker.nextNode()) nodes.push(walker.currentNode);
-          nodes.forEach(highlightNode);
-          if (first) first.scrollIntoView({block: 'center', inline: 'nearest'});
-        };
-        </script>
-        </body>
-        </html>
-        """
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        let payload = Self.jsStringLiteral(pendingJump ?? "")
+        guard let pending = pendingJump, pending.token == loadToken else { return }
+        let payload = Self.jsStringLiteral(pending.text ?? "")
         webView.evaluateJavaScript("window.pqJumpTo && window.pqJumpTo(\(payload))") { _, _ in }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if navigationAction.navigationType == .other || navigationAction.navigationType == .reload {
+            decisionHandler(.allow)
+            return
+        }
+        if let url = navigationAction.request.url,
+           let scheme = url.scheme?.lowercased(),
+           scheme == "http" || scheme == "https" {
+            NSWorkspace.shared.open(url)
+        }
+        decisionHandler(.cancel)
     }
 
     /// JSON string literal suitable for embedding in `evaluateJavaScript`.
@@ -2921,15 +2431,6 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     func tableViewSelectionDidChange(_ notification: Notification) {
         let row = tableView.selectedRow
         if row >= 0 { showPreview(for: row) }
-    }
-}
-
-/// Shared HTML escaping for the preview wrapper (avoids depending on MarkdownHTML's private API).
-private enum MarkdownHTMLEscape {
-    static func escape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }
 
@@ -3021,39 +2522,17 @@ final class SettingsWindowController: NSObject {
         vaultRow.alignment = .centerY
         vaultRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
 
-        // Phrases editor: a small scrollable text view, one phrase per line.
-        let phrasesScroll = NSScrollView()
-        phrasesTextView = NSTextView()
-        phrasesTextView.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        phrasesTextView.isRichText = false
-        phrasesTextView.isAutomaticQuoteSubstitutionEnabled = false
-        phrasesTextView.isAutomaticDashSubstitutionEnabled = false
-        phrasesTextView.allowsUndo = true
-        phrasesTextView.textContainerInset = NSSize(width: 4, height: 4)
-        phrasesScroll.documentView = phrasesTextView
-        phrasesScroll.hasVerticalScroller = true
-        phrasesScroll.hasHorizontalScroller = false
-        phrasesScroll.borderType = .bezelBorder
-        phrasesScroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
-        phrasesScroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        // Phrases / excludes editors. Explicit text+bg colors: bare NSTextView in
+        // an LSUIElement app can pick up menu-bar dark appearance on macOS 26 and
+        // draw white text on a light bezel.
+        let phrasesScroll = makeSettingsTextScroll()
+        phrasesTextView = phrasesScroll.documentView as? NSTextView
         NotificationCenter.default.addObserver(
             self, selector: #selector(phrasesChanged),
             name: NSText.didChangeNotification, object: phrasesTextView)
 
-        let excludesScroll = NSScrollView()
-        excludesTextView = NSTextView()
-        excludesTextView.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        excludesTextView.isRichText = false
-        excludesTextView.isAutomaticQuoteSubstitutionEnabled = false
-        excludesTextView.isAutomaticDashSubstitutionEnabled = false
-        excludesTextView.allowsUndo = true
-        excludesTextView.textContainerInset = NSSize(width: 4, height: 4)
-        excludesScroll.documentView = excludesTextView
-        excludesScroll.hasVerticalScroller = true
-        excludesScroll.hasHorizontalScroller = false
-        excludesScroll.borderType = .bezelBorder
-        excludesScroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
-        excludesScroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        let excludesScroll = makeSettingsTextScroll()
+        excludesTextView = excludesScroll.documentView as? NSTextView
         NotificationCenter.default.addObserver(
             self, selector: #selector(excludesChanged),
             name: NSText.didChangeNotification, object: excludesTextView)
@@ -3162,6 +2641,8 @@ final class SettingsWindowController: NSObject {
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "设置"
         w.isReleasedWhenClosed = false
+        // Don't inherit the status-item's dark chrome; follow the system UI style.
+        w.appearance = Self.systemWindowAppearance()
         let content = NSView()
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -3178,7 +2659,62 @@ final class SettingsWindowController: NSObject {
         window = w
     }
 
+    private func makeSettingsTextScroll() -> NSScrollView {
+        let tv = NSTextView()
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        tv.font = font
+        tv.textColor = .textColor
+        tv.backgroundColor = .textBackgroundColor
+        tv.drawsBackground = true
+        tv.insertionPointColor = .textColor
+        tv.isRichText = false
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.allowsUndo = true
+        tv.textContainerInset = NSSize(width: 4, height: 4)
+        tv.typingAttributes = [
+            .font: font,
+            .foregroundColor: NSColor.textColor,
+        ]
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(
+            width: Self.controlWidth, height: CGFloat.greatestFiniteMagnitude)
+
+        let scroll = NSScrollView()
+        scroll.documentView = tv
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = true
+        scroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        return scroll
+    }
+
+    /// Resolve aqua / darkAqua from the system preference so settings don't
+    /// inherit the menu-bar's dark effective appearance (LSUIElement).
+    private static func systemWindowAppearance() -> NSAppearance {
+        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        return NSAppearance(named: dark ? .darkAqua : .aqua)
+            ?? NSAppearance.currentDrawing()
+    }
+
+    private func setEditorString(_ tv: NSTextView, _ string: String) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: tv.font ?? NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.textColor,
+        ]
+        tv.typingAttributes = attrs
+        tv.textStorage?.setAttributedString(NSAttributedString(string: string, attributes: attrs))
+        tv.textColor = .textColor
+        tv.backgroundColor = .textBackgroundColor
+    }
+
     private func syncFromSettings() {
+        window?.appearance = Self.systemWindowAppearance()
         summonPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.summonModifier) ?? 0)
         searchPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.searchModifier) ?? 0)
         openPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.openModifier) ?? 0)
@@ -3190,8 +2726,8 @@ final class SettingsWindowController: NSObject {
         pathLabel.toolTip = ScreenshotLocation.url.path
         vaultLabel.stringValue = displayPath(Settings.notesVaultPath)
         vaultLabel.toolTip = Settings.notesVaultPath
-        excludesTextView.string = Settings.notesExcludeDirs.joined(separator: "\n")
-        phrasesTextView.string = Settings.quickPhrases.joined(separator: "\n")
+        setEditorString(excludesTextView, Settings.notesExcludeDirs.joined(separator: "\n"))
+        setEditorString(phrasesTextView, Settings.quickPhrases.joined(separator: "\n"))
     }
 
     @objc private func changed() {
@@ -3401,29 +2937,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = true
         if let button = statusItem.button {
-            // Dedicated menu-bar template: flat gray-black silhouette (system-tinted).
-            // MenuBarIcon.png + MenuBarIcon@2x.png live in Resources/.
-            if let icon = NSImage(named: "MenuBarIcon") {
-                icon.size = NSSize(width: 19, height: 19)
-                icon.isTemplate = true
+            // Template silhouette; must include @2x/@3x reps — loading only the
+            // 1x PNG via file URL upscales on Retina and looks blurry/jagged.
+            if let icon = Self.loadMenuBarIcon() {
                 button.image = icon
-            } else if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-                      let icon = NSImage(contentsOf: url) {
-                icon.size = NSSize(width: 19, height: 19)
-                icon.isTemplate = true
-                button.image = icon
+                button.imagePosition = .imageOnly
             } else {
-                let sym = NSImage(
-                    systemSymbolName: "text.cursor", accessibilityDescription: "PromptQy")
-                sym?.isTemplate = true
-                button.image = sym
+                button.title = "Qy"
             }
+            button.toolTip = "PromptQy"
+            button.appearsDisabled = false
         }
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
+    }
+
+    /// Build a multi-representation template image (18pt) so Retina uses @2x/@3x.
+    private static func loadMenuBarIcon() -> NSImage? {
+        let point = NSSize(width: 18, height: 18)
+        // NSImage(named:) pairs MenuBarIcon.png + @2x/@3x when both are in Resources.
+        if let named = NSImage(named: "MenuBarIcon"), named.isValid {
+            named.size = point
+            named.isTemplate = true
+            return named
+        }
+        let image = NSImage(size: point)
+        let files: [(String, CGFloat)] = [
+            ("MenuBarIcon", 1),
+            ("MenuBarIcon@2x", 2),
+            ("MenuBarIcon@3x", 3),
+        ]
+        for (name, scale) in files {
+            guard let url = Bundle.main.url(forResource: name, withExtension: "png"),
+                  let data = try? Data(contentsOf: url),
+                  let rep = NSBitmapImageRep(data: data) else { continue }
+            rep.size = NSSize(
+                width: CGFloat(rep.pixelsWide) / scale,
+                height: CGFloat(rep.pixelsHigh) / scale)
+            image.addRepresentation(rep)
+        }
+        guard !image.representations.isEmpty else {
+            if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+               let img = NSImage(contentsOf: url) {
+                img.size = point
+                img.isTemplate = true
+                return img
+            }
+            return NSImage(systemSymbolName: "text.cursor", accessibilityDescription: "PromptQy")
+        }
+        image.isTemplate = true
+        image.size = point
+        return image
     }
 
     /// Rebuild the menu each time it opens so the history section stays fresh.
@@ -3590,9 +3158,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// MARK: - Entry point
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Explicit entry — `@main` on AppDelegate + NSApplicationMain does not always
+// wire the delegate when Info.plist has no nib/storyboard, leaving an idle
+// process with no menu-bar item.
+@main
+enum PromptQyMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}

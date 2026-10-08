@@ -1,0 +1,97 @@
+name: PromptQy
+options:
+  bundleIdPrefix: io.github
+  deploymentTarget:
+    macOS: "11.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "11.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.20"
+
+targets:
+  PromptQy:
+    type: application
+    platform: macOS
+    sources:
+      - path: command_bar.swift
+      - path: Shared
+        excludes:
+          - TextDocumentThumbnail.swift
+      - path: assets/MenuBarIcon.png
+        buildPhase: resources
+      - path: assets/MenuBarIcon@2x.png
+        buildPhase: resources
+      - path: assets/MenuBarIcon@3x.png
+        buildPhase: resources
+      - path: App/AppIcon.icns
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.promptqy
+        PRODUCT_NAME: PromptQy
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        # Keep MenuBarIcon.png + @2x as separate files (NSImage(named:)).
+        # Combining into .tiff + a merge-install into /Applications left orphan
+        # PNGs that broke codesign ("sealed resource is missing or invalid").
+        COMBINE_HIDPI_IMAGES: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        OTHER_LDFLAGS: []
+        CODE_SIGNING_ALLOWED: YES
+    dependencies:
+      - target: MarkdownPreview
+        embed: true
+      - target: MarkdownThumbnail
+        embed: true
+    scheme:
+      testTargets: []
+
+  MarkdownPreview:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: MarkdownPreview
+        excludes:
+          - Info.plist
+          - "*.entitlements"
+      - path: Shared
+        excludes:
+          - TextDocumentThumbnail.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.promptqy.MarkdownPreview
+        PRODUCT_NAME: MarkdownPreview
+        INFOPLIST_FILE: MarkdownPreview/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: MarkdownPreview/MarkdownPreview.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks @executable_path/../../../../Frameworks"
+        SKIP_INSTALL: YES
+
+  MarkdownThumbnail:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: MarkdownThumbnail
+        excludes:
+          - Info.plist
+          - "*.entitlements"
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.promptqy.MarkdownThumbnail
+        PRODUCT_NAME: MarkdownThumbnail
+        INFOPLIST_FILE: MarkdownThumbnail/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: MarkdownThumbnail/MarkdownThumbnail.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks @executable_path/../../../../Frameworks"
+        SKIP_INSTALL: YES
