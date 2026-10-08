@@ -26,7 +26,8 @@ func drawTemplate(in ctx: CGContext) {
 
     let cx = pointSize / 2
     let cy = pointSize / 2 + 0.25
-    let radius: CGFloat = 6.85
+    // Outer ring a touch larger; caret / equals stay the same size.
+    let radius: CGFloat = 7.4
 
     // Tail at bottom-left — a bit longer + narrower mouth → sharper tip.
     let tipAngle = CGFloat.pi * 1.28

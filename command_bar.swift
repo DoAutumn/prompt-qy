@@ -25,6 +25,8 @@ import ApplicationServices
 import Speech
 import AVFoundation
 import WebKit
+import IOKit.pwr_mgt
+import IOKit.pwr_mgt
 
 // MARK: - Settings
 
@@ -117,6 +119,13 @@ enum Settings {
         get { let v = d.integer(forKey: "dictationKeyCode"); return v != 0 ? UInt16(v) : 0x3D }
         set { d.set(Int(newValue), forKey: "dictationKeyCode") }
     }
+    /// Keep the Mac awake (no idle sleep / display sleep) while PromptQy runs.
+    /// Manual lock / Sleep still work. Persists across relaunches.
+    static var preventAutoSleep: Bool {
+        get { d.bool(forKey: "preventAutoSleep") }
+        set { d.set(newValue, forKey: "preventAutoSleep") }
+    }
+
     /// Quick phrases shown in the menu bar for one-click insertion.
     /// Stored as a newline-separated string in UserDefaults so it's easy to edit
     /// in the settings panel with a plain text view.
@@ -134,6 +143,59 @@ enum Settings {
             ]
         }
         set { d.set(newValue.joined(separator: "\n"), forKey: "quickPhrases") }
+    }
+}
+
+// MARK: - Sleep prevention
+
+/// Idle-only assertions: blocks automatic sleep + display sleep, but still
+/// allows the user to lock the screen or choose Sleep from the Apple menu.
+enum SleepPrevention {
+    private static var systemAssertion: IOPMAssertionID = 0
+    private static var displayAssertion: IOPMAssertionID = 0
+    private static var holding = false
+
+    /// Apply preference and take / drop assertions.
+    static func setEnabled(_ enabled: Bool) {
+        Settings.preventAutoSleep = enabled
+        if enabled { acquire() } else { release() }
+    }
+
+    /// Re-acquire after launch when the preference is still on.
+    static func restoreIfNeeded() {
+        if Settings.preventAutoSleep { acquire() }
+    }
+
+    static func release() {
+        if systemAssertion != 0 {
+            IOPMAssertionRelease(systemAssertion)
+            systemAssertion = 0
+        }
+        if displayAssertion != 0 {
+            IOPMAssertionRelease(displayAssertion)
+            displayAssertion = 0
+        }
+        holding = false
+    }
+
+    private static func acquire() {
+        guard !holding else { return }
+        let reason = "PromptQy 阻止系统自动休眠" as CFString
+        var sys: IOPMAssertionID = 0
+        var disp: IOPMAssertionID = 0
+        if IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason, &sys) == kIOReturnSuccess {
+            systemAssertion = sys
+        }
+        if IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason, &disp) == kIOReturnSuccess {
+            displayAssertion = disp
+        }
+        holding = systemAssertion != 0 || displayAssertion != 0
     }
 }
 
@@ -2834,9 +2896,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.panel.insertAtCursor(PathFormat.forInsertion(url.path) + "\n")
         }
         screenshotWatcher.start()
+        SleepPrevention.restoreIfNeeded()
 
         ensureAccessibilityPermission()
         ensureSpeechPermission()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Drop assertions on quit; preference stays so the next launch restores.
+        SleepPrevention.release()
     }
 
     /// (Re)create the double-tap monitors from the current settings.
@@ -3000,8 +3068,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let open = menu.addItem(withTitle: "打开编辑器", action: #selector(showEditor), keyEquivalent: "")
         open.target = self
-        let notes = menu.addItem(withTitle: "搜索笔记…", action: #selector(showNotesSearch), keyEquivalent: "")
+        let notes = menu.addItem(withTitle: "搜索Obsidian笔记", action: #selector(showNotesSearch), keyEquivalent: "")
         notes.target = self
+        let shot = menu.addItem(
+            withTitle: "截图后立即保存",
+            action: #selector(toggleScreenshotThumbnail), keyEquivalent: "")
+        shot.target = self
+        shot.state = ScreenshotThumbnail.isDisabled ? .on : .off
+        let awake = menu.addItem(
+            withTitle: "阻止系统自动休眠",
+            action: #selector(togglePreventAutoSleep), keyEquivalent: "")
+        awake.target = self
+        awake.state = Settings.preventAutoSleep ? .on : .off
         menu.addItem(.separator())
 
         let phrases = Settings.quickPhrases
@@ -3041,12 +3119,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             clear.target = self
         }
         menu.addItem(.separator())
-        let shot = menu.addItem(
-            withTitle: "截图后立即插入（关闭悬浮缩略图）",
-            action: #selector(toggleScreenshotThumbnail), keyEquivalent: "")
-        shot.target = self
-        shot.state = ScreenshotThumbnail.isDisabled ? .on : .off
-        menu.addItem(.separator())
         let settings = menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: "")
         settings.target = self
         menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
@@ -3078,6 +3150,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// inserted — immediately instead of after the ~5s preview.
     @objc private func toggleScreenshotThumbnail() {
         ScreenshotThumbnail.setDisabled(!ScreenshotThumbnail.isDisabled)
+    }
+
+    @objc private func togglePreventAutoSleep() {
+        SleepPrevention.setEnabled(!Settings.preventAutoSleep)
     }
 
     /// Double-tap Control always shows/focuses the editor (never hides it —
