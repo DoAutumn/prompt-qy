@@ -1041,12 +1041,15 @@ final class DoubleTapMonitor {
 
 /// Thin wrapper around SFSpeechRecognizer + AVAudioEngine for real-time,
 /// streaming dictation. Supports push-to-talk via partial/final callbacks.
+/// Engine + recognizer are created on first `startRecording()` so idle launch
+/// does not pull AVFoundation/Speech stacks into RAM.
 final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
-    private let speechRecognizer: SFSpeechRecognizer?
-    private let audioEngine = AVAudioEngine()
+    private var speechRecognizer: SFSpeechRecognizer?
+    private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var tapInstalled = false
+    private let locale: Locale
 
     /// Called on the main thread with partial (in-progress) transcription.
     var onPartialResult: ((String) -> Void)?
@@ -1057,12 +1060,11 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     /// Called on error (permission denied, network, etc.).
     var onError: ((String) -> Void)?
 
-    var isRecording: Bool { audioEngine.isRunning }
+    var isRecording: Bool { audioEngine?.isRunning ?? false }
 
     init(locale: Locale = Locale(identifier: "zh-CN")) {
-        speechRecognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer()
+        self.locale = locale
         super.init()
-        speechRecognizer?.delegate = self
     }
 
     /// Request speech-recognition authorization. Must be called before recording.
@@ -1080,11 +1082,32 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
         SFSpeechRecognizer.authorizationStatus()
     }
 
-    func startRecording() throws {
+    /// Allocate recognizer + audio engine on first use.
+    private func prepare() throws -> (SFSpeechRecognizer, AVAudioEngine) {
+        if speechRecognizer == nil {
+            guard let recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer() else {
+                throw NSError(domain: "VoiceRecognizer", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "当前系统不支持语音识别"])
+            }
+            recognizer.delegate = self
+            speechRecognizer = recognizer
+        }
         guard let speechRecognizer else {
             throw NSError(domain: "VoiceRecognizer", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "当前系统不支持语音识别"])
         }
+        if audioEngine == nil {
+            audioEngine = AVAudioEngine()
+        }
+        guard let audioEngine else {
+            throw NSError(domain: "VoiceRecognizer", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "无法初始化音频引擎"])
+        }
+        return (speechRecognizer, audioEngine)
+    }
+
+    func startRecording() throws {
+        let (speechRecognizer, audioEngine) = try prepare()
 
         // Cancel any previous task and leftover tap (e.g. after a failed start).
         recognitionTask?.cancel()
@@ -1140,7 +1163,7 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     }
 
     func stopRecording() {
-        if audioEngine.isRunning { audioEngine.stop() }
+        if let audioEngine, audioEngine.isRunning { audioEngine.stop() }
         removeTapIfNeeded()
         recognitionRequest?.endAudio()
         recognitionRequest = nil
@@ -1152,14 +1175,14 @@ final class VoiceRecognizer: NSObject, SFSpeechRecognizerDelegate {
     func cancel() {
         recognitionTask?.cancel()
         recognitionTask = nil
-        if audioEngine.isRunning { audioEngine.stop() }
+        if let audioEngine, audioEngine.isRunning { audioEngine.stop() }
         removeTapIfNeeded()
         recognitionRequest = nil
         onStateChange?(false)
     }
 
     private func removeTapIfNeeded() {
-        guard tapInstalled else { return }
+        guard tapInstalled, let audioEngine else { return }
         audioEngine.inputNode.removeTap(onBus: 0)
         tapInstalled = false
     }
@@ -1942,12 +1965,15 @@ private final class NotesPanelChrome: NSView {
 /// jumping to the first body match when present. Chrome mirrors Spotlight:
 /// borderless floating panel, custom search row, light status strip.
 final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate {
+    /// Keep WebKit around briefly after hide so rapid re-open stays snappy.
+    private static let webViewTeardownDelay: TimeInterval = 15
+
     private let searchField = NotesSearchField()
     private let tableView = NSTableView()
-    private let previewWeb: WKWebView = {
-        let w = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
-        return w
-    }()
+    /// Created on first show; torn down after the panel stays hidden.
+    private var previewWeb: WKWebView?
+    private var previewPane: NSView!
+    private var webViewTeardownWork: DispatchWorkItem?
     private let statusLabel = NSTextField(labelWithString: "")
     private let placeholderLabel = NSTextField(labelWithString: "搜索文件名或正文…")
     private var splitView: NSSplitView!
@@ -2002,7 +2028,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         super.orderOut(sender)
     }
 
-    /// Drop list bodies / WebKit document while the panel is hidden.
+    /// Drop list bodies and schedule WebKit teardown while the panel is hidden.
     private func releasePreviewResources() {
         searchWork?.cancel()
         searchWork = nil
@@ -2015,11 +2041,68 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         tableView.reloadData()
         matchHint = ""
         statusLabel.stringValue = ""
-        previewWeb.stopLoading()
-        previewWeb.loadHTMLString("<html><body style='background:transparent'></body></html>", baseURL: nil)
+        previewWeb?.stopLoading()
+        scheduleWebViewTeardown()
+    }
+
+    private func scheduleWebViewTeardown() {
+        webViewTeardownWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.teardownPreviewWeb()
+        }
+        webViewTeardownWork = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.webViewTeardownDelay, execute: work)
+    }
+
+    private func cancelWebViewTeardown() {
+        webViewTeardownWork?.cancel()
+        webViewTeardownWork = nil
+    }
+
+    /// Release the WKWebView so WebKit content/GPU/network processes can exit.
+    private func teardownPreviewWeb() {
+        webViewTeardownWork = nil
+        loadToken += 1
+        pendingJump = nil
+        previewedPath = nil
+        previewedQuery = nil
+        guard let web = previewWeb else { return }
+        web.stopLoading()
+        web.navigationDelegate = nil
+        web.removeFromSuperview()
+        previewWeb = nil
+    }
+
+    /// Create or reuse the preview WKWebView (host-side WebKit cost).
+    @discardableResult
+    private func ensurePreviewWeb() -> WKWebView {
+        if let web = previewWeb { return web }
+        let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        web.navigationDelegate = self
+        web.translatesAutoresizingMaskIntoConstraints = false
+        if #available(macOS 12.0, *) {
+            web.underPageBackgroundColor = .windowBackgroundColor
+        }
+        web.setValue(false, forKey: "drawsBackground")
+        web.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+        web.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
+        web.setContentHuggingPriority(.defaultLow, for: .vertical)
+        web.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        previewPane.addSubview(web)
+        NSLayoutConstraint.activate([
+            web.topAnchor.constraint(equalTo: previewPane.topAnchor),
+            web.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor),
+            web.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor),
+        ])
+        previewWeb = web
+        return web
     }
 
     func showAndFocus() {
+        cancelWebViewTeardown()
+        ensurePreviewWeb()
         if !isVisible { center() }
         searchField.stringValue = ""
         runSearch("")
@@ -2137,33 +2220,15 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         listScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         listScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        previewWeb.navigationDelegate = self
-        previewWeb.translatesAutoresizingMaskIntoConstraints = false
-        // Match the opaque panel fill (transparent HTML still used).
-        if #available(macOS 12.0, *) {
-            previewWeb.underPageBackgroundColor = .windowBackgroundColor
-        }
-        previewWeb.setValue(false, forKey: "drawsBackground")
-        // Keep JS for pqJumpTo; navigations are gated in decidePolicyFor.
-        // Wide HTML tables report a huge intrinsic width; don't let that drive the split.
-        previewWeb.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
-        previewWeb.setContentCompressionResistancePriority(.fittingSizeCompression, for: .horizontal)
-        previewWeb.setContentHuggingPriority(.defaultLow, for: .vertical)
-        previewWeb.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-
-        let previewPane = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        previewPane.translatesAutoresizingMaskIntoConstraints = true
-        previewPane.wantsLayer = true
-        previewPane.layer?.backgroundColor = NSColor.clear.cgColor
-        previewPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        previewPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        previewPane.addSubview(previewWeb)
-        NSLayoutConstraint.activate([
-            previewWeb.topAnchor.constraint(equalTo: previewPane.topAnchor),
-            previewWeb.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor),
-            previewWeb.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor),
-            previewWeb.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor),
-        ])
+        // WKWebView is created lazily in ensurePreviewWeb() — keep an empty
+        // pane here so the split layout is stable before first show.
+        let pane = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        pane.translatesAutoresizingMaskIntoConstraints = true
+        pane.wantsLayer = true
+        pane.layer?.backgroundColor = NSColor.clear.cgColor
+        pane.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        previewPane = pane
 
         let split = NSSplitView()
         split.isVertical = true
@@ -2173,7 +2238,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         split.wantsLayer = true
         split.layer?.backgroundColor = NSColor.clear.cgColor
         split.addSubview(listScroll)
-        split.addSubview(previewPane)
+        split.addSubview(pane)
         // List holds its width when the window resizes; preview absorbs the slack.
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(240), forSubviewAt: 1)
@@ -2366,8 +2431,9 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         previewedPath = nil
         previewedQuery = nil
         matchHint = ""
-        previewWeb.stopLoading()
-        previewWeb.loadHTMLString("<html><body style='background:transparent'></body></html>", baseURL: nil)
+        guard let web = previewWeb else { return }
+        web.stopLoading()
+        web.loadHTMLString("<html><body style='background:transparent'></body></html>", baseURL: nil)
     }
 
     private func showPreview(for row: Int) {
@@ -2382,6 +2448,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         previewedPath = path
         previewedQuery = q
 
+        let web = ensurePreviewWeb()
         loadToken += 1
         let token = loadToken
         pendingJump = (token, nil)
@@ -2401,6 +2468,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
             let base = hit.url.deletingLastPathComponent()
             DispatchQueue.main.async {
                 guard let self = self, token == self.loadToken else { return }
+                guard self.previewWeb === web else { return }
                 if q.isEmpty {
                     self.matchHint = ""
                 } else {
@@ -2408,7 +2476,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
                 }
                 self.refreshStatusLine()
                 self.pendingJump = (token, matchText)
-                self.previewWeb.loadHTMLString(page, baseURL: base)
+                web.loadHTMLString(page, baseURL: base)
             }
         }
     }
@@ -2869,7 +2937,8 @@ final class SettingsWindowController: NSObject {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let panel = EditorPanel()
-    private let notesPanel = NotesSearchPanel()
+    /// Built on first notes-search open so launch stays free of WebKit.
+    private var notesPanel: NotesSearchPanel?
     private var summonMonitor: DoubleTapMonitor?
     private var searchMonitor: DoubleTapMonitor?
     private var openMonitor: DoubleTapMonitor?
@@ -2879,6 +2948,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self?.restartMonitors()
         // Path may have changed via the screenshot-location picker.
         self?.screenshotWatcher.start()
+    }
+
+    private func notesSearchPanel() -> NotesSearchPanel {
+        if let notesPanel { return notesPanel }
+        let panel = NotesSearchPanel()
+        notesPanel = panel
+        return panel
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -3126,7 +3202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showEditor() { panel.showAndFocus() }
 
-    @objc private func showNotesSearch() { notesPanel.showAndFocus() }
+    @objc private func showNotesSearch() { notesSearchPanel().showAndFocus() }
 
     @objc private func pickPhrase(_ sender: NSMenuItem) {
         let phrases = Settings.quickPhrases
@@ -3170,7 +3246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Double-tap Option: open the notes search panel.
     private func onNotesSearch() {
-        notesPanel.showAndFocus()
+        notesSearchPanel().showAndFocus()
     }
 
     /// Double-tap Command: open the current Finder selection in Sublime Text.
