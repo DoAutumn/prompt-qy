@@ -99,7 +99,15 @@ enum MarkdownHTML {
             if !current.isEmpty { paras.append(current) }
             return paras
         }
-        func openListItem(indent: Int, kind: String, content: String) {
+        /// Open `<ol>` / `<ul>`. For ordered lists, honor the source marker via
+        /// `start` when a new list begins (code/paragraphs often split lists).
+        func openListTag(_ kind: String, start: Int?) -> String {
+            if kind == "ol", let start, start != 1 {
+                return "<ol start=\"\(start)\">"
+            }
+            return "<\(kind)>"
+        }
+        func openListItem(indent: Int, kind: String, content: String, start: Int? = nil) {
             while let last = listStack.last, last.indent > indent {
                 closeOpenLi()
                 html.append("</\(last.kind)>")
@@ -111,26 +119,26 @@ enum MarkdownHTML {
                     closeOpenLi()
                     html.append("</\(last.kind)>")
                     listStack.removeLast()
-                    html.append("<\(kind)>")
+                    html.append(openListTag(kind, start: start))
                     listStack.append((indent, kind))
                 } else {
                     closeOpenLi()
                 }
             } else {
-                html.append("<\(kind)>")
+                html.append(openListTag(kind, start: start))
                 listStack.append((indent, kind))
             }
             html.append("<li>\(content)")
             openLi = true
         }
-        func emitListItem(indent: Int, kind: String, firstLine: String) {
+        func emitListItem(indent: Int, kind: String, firstLine: String, start: Int? = nil) {
             let paras = consumeListContinuationParagraphs()
             var content = inline(firstLine)
             for para in paras {
                 let text = para.map { inline($0) }.joined(separator: "<br>")
                 content += "<p>\(text)</p>"
             }
-            openListItem(indent: indent, kind: kind, content: content)
+            openListItem(indent: indent, kind: kind, content: content, start: start)
         }
         /// Merge consecutive `>` lines into one `<blockquote>`. Strips leading /
         /// trailing empty `>` so they don't inflate padding via extra `<br>`.
@@ -160,15 +168,15 @@ enum MarkdownHTML {
             let body = collapsed.map { inline($0) }.joined(separator: "<br>")
             return "<blockquote><p>\(body)</p></blockquote>"
         }
-
         while i < lines.count {
             let line = lines[i]
             let trimmedLine = line.trimmingCharacters(in: .whitespaces)
 
             if trimmedLine.isEmpty {
                 flushPara()
-                // Keep lists open across blank lines when the next block is still
-                // a list item (any indent) — otherwise numbering / nesting resets.
+                // Keep lists open across blank lines only when the next block is
+                // still a list item — code/paragraphs close the list (no nest /
+                // indent). Ordered markers reopen with <ol start="N">.
                 var j = i + 1
                 while j < lines.count && lines[j].trimmingCharacters(in: .whitespaces).isEmpty {
                     j += 1
@@ -250,9 +258,11 @@ enum MarkdownHTML {
             if let m = trimmedLine.range(of: #"^\d+\.(?:\s+|$)"#, options: .regularExpression) {
                 flushPara()
                 i += 1
+                let marker = String(trimmedLine[..<m.upperBound])
+                let startNum = Int(marker.filter(\.isNumber)) ?? 1
                 let first = String(trimmedLine[m.upperBound...])
                     .trimmingCharacters(in: .whitespaces)
-                emitListItem(indent: indent, kind: "ol", firstLine: first)
+                emitListItem(indent: indent, kind: "ol", firstLine: first, start: startNum)
                 continue
             }
             // Merge consecutive `>` lines into one blockquote (CommonMark).
