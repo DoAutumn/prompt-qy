@@ -500,7 +500,8 @@ enum MarkdownHTML {
             return "<a href=\"\(HTMLEscape.escapeAttribute(g[2]))\">\(g[1])</a>"
         }
         t = replace(t, pattern: #"`([^`]+)`"#) { "<code>\($0[1])</code>" }
-        t = replace(t, pattern: #"~~([^~]+)~~"#) { "<del>\($0[1])</del>" }
+        // Allow a lone `~` inside (e.g. `~/path`); only `~~` closes.
+        t = replace(t, pattern: #"~~((?:[^~]|~(?!~))+?)~~"#) { "<del>\($0[1])</del>" }
         t = replace(t, pattern: #"\*\*([^*]+)\*\*"#) { "<strong>\($0[1])</strong>" }
         t = replace(t, pattern: #"__([^_]+)__"#) { "<strong>\($0[1])</strong>" }
         t = replace(t, pattern: #"(?<!\w)\*([^*]+)\*(?!\w)"#) { "<em>\($0[1])</em>" }
