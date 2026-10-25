@@ -23,6 +23,7 @@ targets:
     platform: macOS
     sources:
       - path: command_bar.swift
+      - path: Clipboard
       - path: Shared
         excludes:
           - TextDocumentThumbnail.swift

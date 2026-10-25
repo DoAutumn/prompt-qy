@@ -17,6 +17,8 @@
 //   7. Double-tap Option to search Obsidian .md / .sheet notes: floating Spotlight-like
 //      panel with Markdown preview (select/copy, jump to first match); vault
 //      path + exclude dirs configurable in Settings.
+//   8. Clipboard history (⌘⇧C): text + images (original on disk, thumbs in list);
+//      Enter copies; ⌥↵ inserts into editor.
 //
 // Build via ./build_app.sh.
 
@@ -57,6 +59,15 @@ enum ModifierChoice: String, CaseIterable {
         case .option: return "Option (⌥)"
         case .command: return "Command (⌘)"
         case .shift: return "Shift (⇧)"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .control: return "⌃"
+        case .option: return "⌥"
+        case .command: return "⌘"
+        case .shift: return "⇧"
         }
     }
 }
@@ -125,6 +136,23 @@ enum Settings {
         get { d.bool(forKey: "preventAutoSleep") }
         set { d.set(newValue, forKey: "preventAutoSleep") }
     }
+
+    /// Poll interval for pasteboard `changeCount` (seconds).
+    static var clipboardCheckInterval: TimeInterval { 0.5 }
+    /// Max unpinned text clips retained.
+    static var clipboardTextLimit: Int {
+        get { let v = d.integer(forKey: "clipboardTextLimit"); return v > 0 ? v : 100 }
+        set { d.set(newValue, forKey: "clipboardTextLimit") }
+    }
+    /// Max unpinned image clips retained.
+    static var clipboardImageLimit: Int {
+        get { let v = d.integer(forKey: "clipboardImageLimit"); return v > 0 ? v : 20 }
+        set { d.set(newValue, forKey: "clipboardImageLimit") }
+    }
+    /// Soft cap on unpinned image payload bytes on disk (~200 MB).
+    static var clipboardImageDiskBudget: Int { 200 * 1024 * 1024 }
+    static var clipboardMaxTextBytes: Int { 256 * 1024 }
+    static var clipboardMaxImageBytes: Int { 10 * 1024 * 1024 }
 
     /// Quick phrases shown in the menu bar for one-click insertion.
     /// Stored as a newline-separated string in UserDefaults so it's easy to edit
@@ -305,30 +333,33 @@ enum SelectionReader {
     }
 
     private static func copyViaCmdC() -> String? {
-        let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
-        let before = pb.changeCount
+        ClipboardGate.withPaused {
+            let pb = NSPasteboard.general
+            let saved = pb.string(forType: .string)
+            let before = pb.changeCount
 
-        let src = CGEventSource(stateID: .hidSystemState)
-        let down = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true)  // 'c'
-        down?.flags = .maskCommand
-        let up = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
-        up?.flags = .maskCommand
-        down?.post(tap: .cgAnnotatedSessionEventTap)
-        up?.post(tap: .cgAnnotatedSessionEventTap)
+            let src = CGEventSource(stateID: .hidSystemState)
+            let down = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true)  // 'c'
+            down?.flags = .maskCommand
+            let up = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
+            up?.flags = .maskCommand
+            down?.post(tap: .cgAnnotatedSessionEventTap)
+            up?.post(tap: .cgAnnotatedSessionEventTap)
 
-        var result: String?
-        for _ in 0..<30 {  // up to ~300ms for the pasteboard to update
-            usleep(10_000)
-            if pb.changeCount != before {
-                result = pb.string(forType: .string)
-                break
+            var result: String?
+            for _ in 0..<30 {  // up to ~300ms for the pasteboard to update
+                usleep(10_000)
+                if pb.changeCount != before {
+                    result = pb.string(forType: .string)
+                    break
+                }
             }
+            // Restore the previous clipboard contents.
+            pb.clearContents()
+            if let saved = saved { pb.setString(saved, forType: .string) }
+            ClipboardMonitor.shared.syncChangeCount()
+            return (result?.isEmpty == false) ? result : nil
         }
-        // Restore the previous clipboard contents.
-        pb.clearContents()
-        if let saved = saved { pb.setString(saved, forType: .string) }
-        return (result?.isEmpty == false) ? result : nil
     }
 }
 
@@ -698,62 +729,68 @@ enum TerminalSender {
     /// `NSApp.deactivate`); otherwise the terminal can never become the
     /// LaunchServices-frontmost app and the paste vanishes into us.
     static func send(_ text: String, to target: Target) -> Bool {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        guard pb.setString(text, forType: .string) else {
-            AppleScriptRunner.lastError = "无法写入剪贴板"
-            return false
-        }
-
-        guard waitForModifiersReleased() else {
-            AppleScriptRunner.lastError =
-                "修饰键仍按着（⌘/⌥/⌃/⇧）。请松开后再发送，否则粘贴/回车会被改写。"
-            return false
-        }
-
-        guard focusTab(target) else { return false }
-
-        guard let running = NSRunningApplication
-            .runningApplications(withBundleIdentifier: target.app.bundleId).first else {
-            AppleScriptRunner.lastError = "\(target.app.displayName) 已退出"
-            return false
-        }
-        // IgnoringOtherApps is required for an LSUIElement sender: without it,
-        // activate is a no-op when another "real" app is already active.
-        running.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
-
-        guard waitUntilFrontmost(target.app) else {
-            AppleScriptRunner.lastError =
-                "\(target.app.displayName) 窗口未能切到前台，内容已保留，请重试。"
-            return false
-        }
-
-        // Tab selection + activate both settle asynchronously; a short beat
-        // after LS-frontmost keeps ⌘V from landing on a half-focused pane.
-        usleep(100_000)
-
-        // Clipboard can be stolen between setString and paste (clipboard
-        // managers, other monitors). Refuse rather than pasting the wrong thing
-        // and then clearing the editor.
-        guard pb.string(forType: .string) == text else {
+        return ClipboardGate.withPaused {
+            let pb = NSPasteboard.general
             pb.clearContents()
-            pb.setString(text, forType: .string)
-            AppleScriptRunner.lastError =
-                "剪贴板在发送前被其他程序改写，内容已保留，请重试。"
-            return false
+            guard pb.setString(text, forType: .string) else {
+                AppleScriptRunner.lastError = "无法写入剪贴板"
+                return false
+            }
+            pb.setString("", forType: .promptqyClipboard)
+            ClipboardMonitor.shared.syncChangeCount()
+
+            guard waitForModifiersReleased() else {
+                AppleScriptRunner.lastError =
+                    "修饰键仍按着（⌘/⌥/⌃/⇧）。请松开后再发送，否则粘贴/回车会被改写。"
+                return false
+            }
+
+            guard focusTab(target) else { return false }
+
+            guard let running = NSRunningApplication
+                .runningApplications(withBundleIdentifier: target.app.bundleId).first else {
+                AppleScriptRunner.lastError = "\(target.app.displayName) 已退出"
+                return false
+            }
+            // IgnoringOtherApps is required for an LSUIElement sender: without it,
+            // activate is a no-op when another "real" app is already active.
+            running.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+
+            guard waitUntilFrontmost(target.app) else {
+                AppleScriptRunner.lastError =
+                    "\(target.app.displayName) 窗口未能切到前台，内容已保留，请重试。"
+                return false
+            }
+
+            // Tab selection + activate both settle asynchronously; a short beat
+            // after LS-frontmost keeps ⌘V from landing on a half-focused pane.
+            usleep(100_000)
+
+            // Clipboard can be stolen between setString and paste (clipboard
+            // managers, other monitors). Refuse rather than pasting the wrong thing
+            // and then clearing the editor.
+            guard pb.string(forType: .string) == text else {
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+                pb.setString("", forType: .promptqyClipboard)
+                ClipboardMonitor.shared.syncChangeCount()
+                AppleScriptRunner.lastError =
+                    "剪贴板在发送前被其他程序改写，内容已保留，请重试。"
+                return false
+            }
+
+            // 0x09 = 'v', 0x24 = Return. HID tap, not System Events keystroke —
+            // the latter has no target and races the same AX/LS frontmost split.
+            postKey(0x09, flags: .maskCommand)
+
+            // Bracketed paste needs a moment before Return, else Claude Code sees
+            // an empty submit and the paste arrives after. Scale lightly with size.
+            let pasteSettle = UInt32(min(500_000, 60_000 + text.utf8.count * 20))
+            usleep(pasteSettle)
+
+            postKey(0x24, flags: [])
+            return true
         }
-
-        // 0x09 = 'v', 0x24 = Return. HID tap, not System Events keystroke —
-        // the latter has no target and races the same AX/LS frontmost split.
-        postKey(0x09, flags: .maskCommand)
-
-        // Bracketed paste needs a moment before Return, else Claude Code sees
-        // an empty submit and the paste arrives after. Scale lightly with size.
-        let pasteSettle = UInt32(min(500_000, 60_000 + text.utf8.count * 20))
-        usleep(pasteSettle)
-
-        postKey(0x24, flags: [])
-        return true
     }
 }
 
@@ -2577,12 +2614,8 @@ final class SettingsWindowController: NSObject {
 
     private var window: NSWindow?
     private let onChange: () -> Void
-    private let terminalPopup = NSPopUpButton()
-    private let summonPopup = NSPopUpButton()
-    private let searchPopup = NSPopUpButton()
-    private let openPopup = NSPopUpButton()
-    private let historyPopup = NSPopUpButton()
-    private let widthPopup = NSPopUpButton()
+    private let clipboardTextLimitPopup = NSPopUpButton()
+    private let clipboardImageLimitPopup = NSPopUpButton()
     private let pathLabel = NSTextField(labelWithString: "")
     private let choosePathButton = NSButton(title: "选择…", target: nil, action: nil)
     private let vaultLabel = NSTextField(labelWithString: "")
@@ -2595,33 +2628,24 @@ final class SettingsWindowController: NSObject {
     }
 
     func show() {
-        let isFirstShow = window == nil
-        if isFirstShow { build() }
+        if window == nil {
+            build()
+            window?.center()
+        }
         syncFromSettings()
-        if isFirstShow { window?.center() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     private func build() {
-        for m in ModifierChoice.allCases {
-            summonPopup.addItem(withTitle: m.displayName)
-            searchPopup.addItem(withTitle: m.displayName)
-            openPopup.addItem(withTitle: m.displayName)
-        }
-        for n in [10, 20, 50, 100, 200] { historyPopup.addItem(withTitle: "\(n)") }
-        for w in [20, 30, 40, 60, 80] { widthPopup.addItem(withTitle: "\(w)") }
-        // Index 0 is auto; the rest track `TerminalApp.allCases` positionally.
-        terminalPopup.addItem(withTitle: "自动")
-        for app in TerminalApp.allCases { terminalPopup.addItem(withTitle: app.displayName) }
-        let popups = [terminalPopup, summonPopup, searchPopup, openPopup, historyPopup, widthPopup]
-        for popup in popups {
+        clipboardTextLimitPopup.removeAllItems()
+        clipboardImageLimitPopup.removeAllItems()
+        for n in [20, 50, 100, 200, 500] { clipboardTextLimitPopup.addItem(withTitle: "\(n)") }
+        for n in [10, 20, 50, 100] { clipboardImageLimitPopup.addItem(withTitle: "\(n)") }
+        for popup in [clipboardTextLimitPopup, clipboardImageLimitPopup] {
             popup.target = self
             popup.action = #selector(changed)
-            // Without a fixed width every popup sizes to its own title, so the
-            // column jumps around as the selection changes ("Control (^)" is
-            // narrower than "Option (⌥)").
-            popup.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+            popup.setContentHuggingPriority(.defaultLow, for: .horizontal)
         }
 
         pathLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
@@ -2637,7 +2661,7 @@ final class SettingsWindowController: NSObject {
         pathRow.orientation = .horizontal
         pathRow.spacing = 8
         pathRow.alignment = .centerY
-        pathRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        pathRow.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         vaultLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
         vaultLabel.lineBreakMode = .byTruncatingMiddle
@@ -2650,7 +2674,7 @@ final class SettingsWindowController: NSObject {
         vaultRow.orientation = .horizontal
         vaultRow.spacing = 8
         vaultRow.alignment = .centerY
-        vaultRow.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        vaultRow.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         // Phrases / excludes editors. Explicit text+bg colors: bare NSTextView in
         // an LSUIElement app can pick up menu-bar dark appearance on macOS 26 and
@@ -2667,76 +2691,52 @@ final class SettingsWindowController: NSObject {
             self, selector: #selector(excludesChanged),
             name: NSText.didChangeNotification, object: excludesTextView)
 
-        func row(_ label: String, _ control: NSView) -> [NSView] {
-            let l = NSTextField(labelWithString: label)
-            l.alignment = .right
-            return [l, control]
-        }
-        func makeGrid(_ rows: [[NSView]], footnote: String) -> NSView {
-            let grid = NSGridView(views: rows)
-            grid.rowSpacing = 12
-            grid.columnSpacing = 8
-            grid.rowAlignment = .none
-            for i in 0..<grid.numberOfRows { grid.row(at: i).yPlacement = .center }
-            // Hug label text — a fixed column width left a large empty gutter.
-            grid.column(at: 0).xPlacement = .trailing
-            grid.column(at: 1).xPlacement = .leading
-            grid.column(at: 1).width = Self.controlWidth
-            grid.setContentHuggingPriority(.required, for: .horizontal)
+        let generalTab = makeFeatureTab(
+            controls: [
+                settingsRow("截图路径：", pathRow),
+                settingsRow("常用短语：", phrasesScroll),
+            ],
+            shortcuts: [
+                ("打开编辑器", "双击\(Settings.summonModifier.symbol)"),
+                ("打开文件", "双击\(Settings.openModifier.symbol)"),
+            ],
+            footnote: "截图路径写入系统设置，改动即时生效。常用短语每行一条。")
 
-            let note = NSTextField(wrappingLabelWithString: footnote)
-            note.font = .systemFont(ofSize: 11)
-            note.textColor = .secondaryLabelColor
-            note.alignment = .center
-            note.preferredMaxLayoutWidth = Self.controlWidth + 100
-            note.translatesAutoresizingMaskIntoConstraints = false
+        let clipboardTab = makeFeatureTab(
+            controls: [
+                settingsRow("文字历史：", clipboardTextLimitPopup),
+                settingsRow("图片历史：", clipboardImageLimitPopup),
+            ],
+            shortcuts: [
+                ("呼出面板", "⌘⇧C"),
+                ("复制选中", "↩"),
+                ("插入编辑器", "⌥↩"),
+                ("删除选中", "⌫"),
+                ("删除固定项", "⌘⌫"),
+                ("固定 / 取消", "⌥P"),
+                ("清空未固定", "⌥⌫"),
+                ("清空全部", "⌥⇧⌫"),
+                ("打开设置", "⌘,"),
+                ("关闭面板", "Esc"),
+            ],
+            footnote: "图片原图落盘，列表仅缩略图。固定项不计入条数上限；「清空」不会去掉固定项（需 ⌘⌫ 或清空全部）。")
 
-            let stack = NSStackView(views: [grid, note])
-            stack.orientation = .vertical
-            stack.alignment = .centerX
-            stack.spacing = 14
-            stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            // Pin to the top of the tab so short pages (手势 / 笔记) don't float
-            // to the vertical middle of the fixed-height tab view.
-            let wrap = NSView()
-            wrap.addSubview(stack)
-            NSLayoutConstraint.activate([
-                stack.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
-                stack.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
-                stack.topAnchor.constraint(equalTo: wrap.topAnchor),
-                stack.bottomAnchor.constraint(
-                    lessThanOrEqualTo: wrap.bottomAnchor),
-                note.widthAnchor.constraint(equalTo: grid.widthAnchor),
-            ])
-            return wrap
-        }
-
-        let generalTab = makeGrid([
-            row("目标终端：", terminalPopup),
-            row("历史条数：", historyPopup),
-            row("菜单标题字数：", widthPopup),
-            row("截图保存路径：", pathRow),
-            row("常用语：", phrasesScroll),
-        ], footnote: "截图路径写入系统设置（com.apple.screencapture），重启后仍生效。改动即时生效。")
-
-        let gestureTab = makeGrid([
-            row("呼出编辑器：", summonPopup),
-            row("搜索笔记：", searchPopup),
-            row("打开文件：", openPopup),
-        ], footnote: "均为双击对应修饰键。三个手势请用不同修饰键，否则会冲突。")
-
-        let notesTab = makeGrid([
-            row("笔记库路径：", vaultRow),
-            row("排除目录：", excludesScroll),
-        ], footnote: "排除目录每行一个，默认 .obsidian、.trash。双击 Option（可在「手势」中改）打开搜索。")
+        let notesTab = makeFeatureTab(
+            controls: [
+                settingsRow("笔记库：", vaultRow),
+                settingsRow("排除目录：", excludesScroll),
+            ],
+            shortcuts: [
+                ("打开笔记", "双击\(Settings.searchModifier.symbol)"),
+            ],
+            footnote: "排除目录每行一个，默认 .obsidian、.trash。")
 
         let tabView = NSTabView()
         tabView.tabViewType = .topTabsBezelBorder
         tabView.translatesAutoresizingMaskIntoConstraints = false
         let tabs: [(String, NSView)] = [
             ("通用", generalTab),
-            ("手势", gestureTab),
+            ("剪贴板", clipboardTab),
             ("笔记", notesTab),
         ]
         for (title, view) in tabs {
@@ -2763,11 +2763,10 @@ final class SettingsWindowController: NSObject {
 
         let tabWidth = Self.controlWidth + 120 + 8 + 28
         tabView.widthAnchor.constraint(equalToConstant: tabWidth).isActive = true
-        // Tall enough for the largest tab (通用) without jumping when switching.
-        tabView.heightAnchor.constraint(equalToConstant: 320).isActive = true
+        tabView.heightAnchor.constraint(equalToConstant: 460).isActive = true
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: tabWidth + Self.margin * 2, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: tabWidth + Self.margin * 2, height: 520),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "设置"
         w.isReleasedWhenClosed = false
@@ -2787,6 +2786,88 @@ final class SettingsWindowController: NSObject {
             width: tabWidth + Self.margin * 2,
             height: content.fittingSize.height))
         window = w
+    }
+
+    private func settingsRow(_ title: String, _ control: NSView) -> [NSView] {
+        let l = NSTextField(labelWithString: title)
+        l.alignment = .left
+        l.setContentHuggingPriority(.required, for: .horizontal)
+        return [l, control]
+    }
+
+    /// Shared tab chrome: control grid + centered「快捷键」+ rows + footnote.
+    /// Content fills the tab width (tight L/R inset); labels share one leading edge.
+    private func makeFeatureTab(
+        controls: [[NSView]],
+        shortcuts: [(String, String)],
+        footnote: String
+    ) -> NSView {
+        let inset: CGFloat = 12
+
+        let controlsGrid = NSGridView(views: controls)
+        controlsGrid.rowSpacing = 10
+        controlsGrid.columnSpacing = 8
+        for i in 0..<controlsGrid.numberOfRows { controlsGrid.row(at: i).yPlacement = .center }
+        controlsGrid.column(at: 0).xPlacement = .leading
+        controlsGrid.column(at: 1).xPlacement = .fill
+        controlsGrid.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        controlsGrid.setContentHuggingPriority(.required, for: .vertical)
+
+        let shortcutsHeader = NSTextField(labelWithString: "快捷键")
+        shortcutsHeader.font = .systemFont(ofSize: 12, weight: .semibold)
+        shortcutsHeader.textColor = .secondaryLabelColor
+        shortcutsHeader.alignment = .center
+
+        var gridRows: [[NSView]] = []
+        for (name, key) in shortcuts {
+            let nameLabel = NSTextField(labelWithString: name)
+            nameLabel.font = .systemFont(ofSize: 12)
+            nameLabel.textColor = .labelColor
+            nameLabel.alignment = .left
+            let keyLabel = NSTextField(labelWithString: key)
+            keyLabel.font = .systemFont(ofSize: 12)
+            keyLabel.textColor = .secondaryLabelColor
+            keyLabel.alignment = .right
+            gridRows.append([nameLabel, keyLabel])
+        }
+        let shortcutsGrid = NSGridView(views: gridRows)
+        shortcutsGrid.rowSpacing = 6
+        shortcutsGrid.columnSpacing = 16
+        for i in 0..<shortcutsGrid.numberOfRows { shortcutsGrid.row(at: i).yPlacement = .center }
+        shortcutsGrid.column(at: 0).xPlacement = .leading
+        shortcutsGrid.column(at: 1).xPlacement = .trailing
+        shortcutsGrid.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        shortcutsGrid.setContentHuggingPriority(.required, for: .vertical)
+
+        let note = NSTextField(wrappingLabelWithString: footnote)
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        note.alignment = .left
+        note.maximumNumberOfLines = 0
+
+        let stack = NSStackView(views: [controlsGrid, shortcutsHeader, shortcutsGrid, note])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .gravityAreas
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(14, after: controlsGrid)
+        stack.setCustomSpacing(6, after: shortcutsHeader)
+        stack.setHuggingPriority(.required, for: .vertical)
+
+        let wrap = NSView()
+        wrap.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: inset),
+            stack.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -inset),
+            stack.topAnchor.constraint(equalTo: wrap.topAnchor, constant: inset),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: wrap.bottomAnchor, constant: -inset),
+            controlsGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            shortcutsHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            shortcutsGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            note.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
+        return wrap
     }
 
     private func makeSettingsTextScroll() -> NSScrollView {
@@ -2811,7 +2892,7 @@ final class SettingsWindowController: NSObject {
         tv.autoresizingMask = [.width]
         tv.textContainer?.widthTracksTextView = true
         tv.textContainer?.containerSize = NSSize(
-            width: Self.controlWidth, height: CGFloat.greatestFiniteMagnitude)
+            width: 0, height: CGFloat.greatestFiniteMagnitude)
 
         let scroll = NSScrollView()
         scroll.documentView = tv
@@ -2820,7 +2901,8 @@ final class SettingsWindowController: NSObject {
         scroll.borderType = .bezelBorder
         scroll.drawsBackground = true
         scroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
-        scroll.widthAnchor.constraint(equalToConstant: Self.controlWidth).isActive = true
+        scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        scroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return scroll
     }
 
@@ -2845,13 +2927,8 @@ final class SettingsWindowController: NSObject {
 
     private func syncFromSettings() {
         window?.appearance = Self.systemWindowAppearance()
-        summonPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.summonModifier) ?? 0)
-        searchPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.searchModifier) ?? 0)
-        openPopup.selectItem(at: ModifierChoice.allCases.firstIndex(of: Settings.openModifier) ?? 0)
-        historyPopup.selectItem(withTitle: "\(Settings.historyLimit)")
-        widthPopup.selectItem(withTitle: "\(Settings.labelWidth)")
-        terminalPopup.selectItem(at: Settings.terminalApp
-            .flatMap { TerminalApp.allCases.firstIndex(of: $0) }.map { $0 + 1 } ?? 0)
+        clipboardTextLimitPopup.selectItem(withTitle: "\(Settings.clipboardTextLimit)")
+        clipboardImageLimitPopup.selectItem(withTitle: "\(Settings.clipboardImageLimit)")
         pathLabel.stringValue = ScreenshotLocation.displayPath
         pathLabel.toolTip = ScreenshotLocation.url.path
         vaultLabel.stringValue = displayPath(Settings.notesVaultPath)
@@ -2861,13 +2938,13 @@ final class SettingsWindowController: NSObject {
     }
 
     @objc private func changed() {
-        Settings.summonModifier = ModifierChoice.allCases[summonPopup.indexOfSelectedItem]
-        Settings.searchModifier = ModifierChoice.allCases[searchPopup.indexOfSelectedItem]
-        Settings.openModifier = ModifierChoice.allCases[openPopup.indexOfSelectedItem]
-        if let n = Int(historyPopup.titleOfSelectedItem ?? "") { Settings.historyLimit = n }
-        if let w = Int(widthPopup.titleOfSelectedItem ?? "") { Settings.labelWidth = w }
-        let i = terminalPopup.indexOfSelectedItem
-        Settings.terminalApp = i > 0 ? TerminalApp.allCases[i - 1] : nil
+        if let n = Int(clipboardTextLimitPopup.titleOfSelectedItem ?? "") {
+            Settings.clipboardTextLimit = n
+        }
+        if let n = Int(clipboardImageLimitPopup.titleOfSelectedItem ?? "") {
+            Settings.clipboardImageLimit = n
+        }
+        ClipboardStore.applyLimits()
         onChange()
     }
 
@@ -2939,6 +3016,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let panel = EditorPanel()
     /// Built on first notes-search open so launch stays free of WebKit.
     private var notesPanel: NotesSearchPanel?
+    private lazy var clipboardPanel: ClipboardPanel = {
+        let p = ClipboardPanel()
+        p.onInsertIntoEditor = { [weak self] text in
+            guard let self else { return }
+            self.panel.showAndFocus()
+            self.panel.insertAtCursor(text + "\n")
+        }
+        p.onOpenSettings = { [weak self] in
+            self?.settingsController.show()
+        }
+        return p
+    }()
+    /// Carbon hotkey for ⌘⇧C (survives other apps being frontmost).
+    private var clipboardHotKey: GlobalHotKey?
     private var summonMonitor: DoubleTapMonitor?
     private var searchMonitor: DoubleTapMonitor?
     private var openMonitor: DoubleTapMonitor?
@@ -2946,6 +3037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenshotWatcher: ScreenshotWatcher!
     private lazy var settingsController = SettingsWindowController { [weak self] in
         self?.restartMonitors()
+        ClipboardMonitor.shared.restart()
         // Path may have changed via the screenshot-location picker.
         self?.screenshotWatcher.start()
     }
@@ -2962,7 +3054,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupMainMenu()
         setupStatusItem()
         setupPhrasesShortcuts()
+        setupClipboardHotkey()
         restartMonitors()
+        ClipboardMonitor.shared.start()
 
         screenshotWatcher = ScreenshotWatcher { [weak self] url in
             guard let self = self else { return }
@@ -3041,6 +3135,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard idx < phrases.count else { return }
         panel.showAndFocus()
         panel.insertAtCursor(phrases[idx] + "\n")
+    }
+
+    /// Global ⌘⇧C via Carbon (same class of API Maccy/KeyboardShortcuts use).
+    /// If registration fails, another app (e.g. Maccy) likely owns the chord.
+    private func setupClipboardHotkey() {
+        clipboardHotKey = .commandShiftC { [weak self] in
+            self?.clipboardPanel.toggle()
+        }
     }
 
     /// An accessory (LSUIElement) app has no menu bar, but a main menu is still
@@ -3146,6 +3248,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         open.target = self
         let notes = menu.addItem(withTitle: "搜索Obsidian笔记", action: #selector(showNotesSearch), keyEquivalent: "")
         notes.target = self
+        let clips = menu.addItem(
+            withTitle: "剪贴板历史",
+            action: #selector(showClipboardHistory), keyEquivalent: "c")
+        clips.keyEquivalentModifierMask = [.command, .shift]
+        clips.target = self
         let shot = menu.addItem(
             withTitle: "截图后立即保存",
             action: #selector(toggleScreenshotThumbnail), keyEquivalent: "")
@@ -3203,6 +3310,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showEditor() { panel.showAndFocus() }
 
     @objc private func showNotesSearch() { notesSearchPanel().showAndFocus() }
+
+    @objc private func showClipboardHistory() { clipboardPanel.showAndFocus() }
 
     @objc private func pickPhrase(_ sender: NSMenuItem) {
         let phrases = Settings.quickPhrases
@@ -3273,9 +3382,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "需要「辅助功能」权限"
         alert.informativeText =
-            "双击 Control 呼出、读取选中文本都依赖全局键盘监听。\n"
-            + "请在「辅助功能」列表中勾选「PromptQy」。若已勾选仍提示，"
-            + "请先移除旧条目再重新添加本 App。"
+            "双击 Control 呼出、读取选中文本、⌘⇧C 剪贴板历史都依赖权限。\n"
+            + "请在「辅助功能」列表中勾选「PromptQy」。若已勾选仍无效，"
+            + "请先移除旧条目再重新添加本 App；并确认没有其它 App（如 Maccy）占用 ⌘⇧C。"
         alert.addButton(withTitle: "打开辅助功能设置")
         alert.addButton(withTitle: "稍后")
         if alert.runModal() == .alertFirstButtonReturn {

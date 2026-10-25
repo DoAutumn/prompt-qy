@@ -38,20 +38,36 @@ ARCH="$(uname -m)"
 # Do not pass MACOSX_DEPLOYMENT_TARGET here — it overrides every target and
 # breaks MarkdownPreview (needs 12.0 for QLPreviewProvider). Per-target
 # versions live in project.yml.
-xcodebuild \
-    -project "$ROOT/PromptQy.xcodeproj" \
-    -scheme PromptQy \
-    -configuration Release \
-    -derivedDataPath "$DERIVED" \
-    -destination "platform=macOS,arch=${ARCH}" \
-    ARCHS="$ARCH" \
-    ONLY_ACTIVE_ARCH=YES \
-    MARKETING_VERSION="$VERSION" \
-    CURRENT_PROJECT_VERSION="$VERSION" \
-    CODE_SIGN_IDENTITY="-" \
-    CODE_SIGNING_ALLOWED=YES \
-    CODE_SIGNING_REQUIRED=NO \
+#
+# When stdout is not a TTY (CI / Agent), dump xcodebuild to a log file.
+# Streaming its huge log through a pipe can deadlock SWB's ExecuteExternalTool
+# (clang -v blocks on a full write pipe) and hang the whole build.
+XCODEBUILD_LOG="$ROOT/dist/xcodebuild.log"
+xcodebuild_args=(
+    -project "$ROOT/PromptQy.xcodeproj"
+    -scheme PromptQy
+    -configuration Release
+    -derivedDataPath "$DERIVED"
+    -destination "platform=macOS,arch=${ARCH}"
+    ARCHS="$ARCH"
+    ONLY_ACTIVE_ARCH=YES
+    MARKETING_VERSION="$VERSION"
+    CURRENT_PROJECT_VERSION="$VERSION"
+    CODE_SIGN_IDENTITY="-"
+    CODE_SIGNING_ALLOWED=YES
+    CODE_SIGNING_REQUIRED=NO
     build
+)
+if [[ -t 1 ]]; then
+    xcodebuild "${xcodebuild_args[@]}"
+else
+    echo "    (non-TTY: logging to $XCODEBUILD_LOG)"
+    if ! xcodebuild "${xcodebuild_args[@]}" >"$XCODEBUILD_LOG" 2>&1; then
+        echo "!! xcodebuild failed — last 40 lines:" >&2
+        tail -40 "$XCODEBUILD_LOG" >&2 || true
+        exit 1
+    fi
+fi
 
 BUILT="$DERIVED/Build/Products/Release/$APP_NAME.app"
 [ -d "$BUILT" ] || { echo "!! build product missing: $BUILT" >&2; exit 1; }
@@ -73,22 +89,31 @@ else
     echo "==> Code signing (ad-hoc; run ./setup_signing.sh for a stable identity)"
 fi
 
+# With set -u, empty "${arr[@]}" is unbound on some bash versions.
+codesign_with_identity() {
+    if ((${#keychain_args[@]})); then
+        codesign --force --sign "$sign_identity" "${keychain_args[@]}" "$@"
+    else
+        codesign --force --sign "$sign_identity" "$@"
+    fi
+}
+
 PLUGINS="$APP/Contents/PlugIns"
 if [ -d "$PLUGINS/MarkdownPreview.appex" ]; then
     echo "==> Signing MarkdownPreview.appex"
-    codesign --force --sign "$sign_identity" "${keychain_args[@]}" \
+    codesign_with_identity \
         --entitlements "$ROOT/MarkdownPreview/MarkdownPreview.entitlements" \
         "$PLUGINS/MarkdownPreview.appex"
 fi
 if [ -d "$PLUGINS/MarkdownThumbnail.appex" ]; then
     echo "==> Signing MarkdownThumbnail.appex"
-    codesign --force --sign "$sign_identity" "${keychain_args[@]}" \
+    codesign_with_identity \
         --entitlements "$ROOT/MarkdownThumbnail/MarkdownThumbnail.entitlements" \
         "$PLUGINS/MarkdownThumbnail.appex"
 fi
 
 echo "==> Signing $APP_NAME.app"
-codesign --force --sign "$sign_identity" "${keychain_args[@]}" "$APP"
+codesign_with_identity "$APP"
 codesign -dvv "$APP" 2>&1 | grep -E "Identifier|Authority|Signature" || true
 
 echo "==> PlugIns:"
