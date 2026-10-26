@@ -2,14 +2,14 @@ name: PromptQy
 options:
   bundleIdPrefix: io.github
   deploymentTarget:
-    macOS: "11.0"
+    macOS: "13.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MACOSX_DEPLOYMENT_TARGET: "11.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "-"
     DEVELOPMENT_TEAM: ""
@@ -24,6 +24,7 @@ targets:
     sources:
       - path: command_bar.swift
       - path: Clipboard
+      - path: Settings
       - path: Shared
         excludes:
           - TextDocumentThumbnail.swift
