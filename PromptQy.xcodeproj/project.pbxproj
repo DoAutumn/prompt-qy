@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		06DF07DD8D130103571299CB /* MarkdownHTML.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68F6E5248F5837ACF73172C9 /* MarkdownHTML.swift */; };
 		169334C90755B87D9C49A44D /* SheetHTML.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0905DA0E04D38ADFD201849 /* SheetHTML.swift */; };
+		1A7C3E91B2045F6D8E9A0123 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C3E91B2045F6D8E9A0121 /* SettingsView.swift */; };
+		1A7C3E91B2045F6D8E9A0124 /* SettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C3E91B2045F6D8E9A0122 /* SettingsWindowController.swift */; };
 		1D08A32331503DCC3BC51C9D /* command_bar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A24F88DE12AC5C1AEA63BD84 /* command_bar.swift */; };
 		212AC71A4DBF82021DF0D43B /* SheetHTML.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0905DA0E04D38ADFD201849 /* SheetHTML.swift */; };
 		230D6EE63BE418F19DF6255F /* DocumentPreviewPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00141374E19847144DFB49E7 /* DocumentPreviewPage.swift */; };
@@ -70,6 +72,8 @@
 /* Begin PBXFileReference section */
 		00141374E19847144DFB49E7 /* DocumentPreviewPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentPreviewPage.swift; sourceTree = "<group>"; };
 		14ADA63050B25BF70DAAB20A /* ClipboardMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardMonitor.swift; sourceTree = "<group>"; };
+		1A7C3E91B2045F6D8E9A0121 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		1A7C3E91B2045F6D8E9A0122 /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
 		3148D0343CE55D82BB95EEF9 /* ClipboardStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardStore.swift; sourceTree = "<group>"; };
 		3D5D9B00DE474BC269EE862E /* MarkdownPreview.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MarkdownPreview.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		5FC2B06196B885C60A61CCD1 /* TextDocumentThumbnail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextDocumentThumbnail.swift; sourceTree = "<group>"; };
@@ -104,6 +108,15 @@
 				969B4F1582AC87289D9F92D8 /* AppIcon.icns */,
 			);
 			path = App;
+			sourceTree = "<group>";
+		};
+		1A7C3E91B2045F6D8E9A0120 /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				1A7C3E91B2045F6D8E9A0121 /* SettingsView.swift */,
+				1A7C3E91B2045F6D8E9A0122 /* SettingsWindowController.swift */,
+			);
+			path = Settings;
 			sourceTree = "<group>";
 		};
 		1FAE3F1275FD0F06B30CB0B2 /* Clipboard */ = {
@@ -155,6 +168,7 @@
 				1FAE3F1275FD0F06B30CB0B2 /* Clipboard */,
 				26A94AB016D95C600D0B47CD /* MarkdownPreview */,
 				0974E1D38C3D371417B713F5 /* MarkdownThumbnail */,
+				1A7C3E91B2045F6D8E9A0120 /* Settings */,
 				5CA42BDB5A56A2B898BF85F7 /* Shared */,
 				A24F88DE12AC5C1AEA63BD84 /* command_bar.swift */,
 				745E4B49931156EC92D2AA12 /* Products */,
@@ -313,6 +327,8 @@
 				B959893073CFA3FF76D6C222 /* HTMLEscape.swift in Sources */,
 				8688FC005F1DEDF4B8195761 /* MarkdownHTML.swift in Sources */,
 				169334C90755B87D9C49A44D /* SheetHTML.swift in Sources */,
+				1A7C3E91B2045F6D8E9A0123 /* SettingsView.swift in Sources */,
+				1A7C3E91B2045F6D8E9A0124 /* SettingsWindowController.swift in Sources */,
 				1D08A32331503DCC3BC51C9D /* command_bar.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -416,7 +432,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 0.1.20;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
@@ -479,7 +495,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MARKETING_VERSION = 0.1.20;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
