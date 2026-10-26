@@ -240,6 +240,8 @@ enum ClipboardStore {
     static func touch(_ id: String) {
         mutate { items in
             guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+            // Pinned keep a fixed order — usage must not bump them.
+            if items[i].pinned { return }
             items[i].lastUsedAt = Date()
         }
     }
@@ -248,6 +250,11 @@ enum ClipboardStore {
         mutate { items in
             guard let i = items.firstIndex(where: { $0.id == id }) else { return }
             items[i].pinned = pinned
+            if pinned {
+                // Newly pinned → top of the pinned section (stable thereafter).
+                let item = items.remove(at: i)
+                items.insert(item, at: 0)
+            }
         }
         enforceLimits()
     }
@@ -307,11 +314,16 @@ enum ClipboardStore {
         let now = Date()
         if let i = items.firstIndex(where: { $0.contentHash == contentHash }) {
             var existing = items[i]
-            existing.lastUsedAt = now
             existing.preview = preview
             if let sourceApp { existing.sourceApp = sourceApp }
-            items.remove(at: i)
-            items.insert(existing, at: 0)
+            if existing.pinned {
+                // Keep position + lastUsedAt so pinned order stays put.
+                items[i] = existing
+            } else {
+                existing.lastUsedAt = now
+                items.remove(at: i)
+                items.insert(existing, at: 0)
+            }
             saveUnlocked(items)
             lock.unlock()
             enforceLimits()
@@ -428,10 +440,11 @@ enum ClipboardStore {
     }
 
     private static func sorted(_ items: [Item]) -> [Item] {
-        items.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned && !b.pinned }
-            return a.lastUsedAt > b.lastUsedAt
-        }
+        // Pinned: preserve storage order (usage never reorders them).
+        // Unpinned: most recently used first.
+        let pinned = items.filter(\.pinned)
+        let unpinned = items.filter { !$0.pinned }.sorted { $0.lastUsedAt > $1.lastUsedAt }
+        return pinned + unpinned
     }
 
     private static func removeFiles(for item: Item) {

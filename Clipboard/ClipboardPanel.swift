@@ -13,9 +13,9 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     fileprivate static let textInset: CGFloat = 10
     private static let vPad: CGFloat = 5
     private static let sepPad: CGFloat = 6
-    /// Match Maccy-ish usable width (previous 214/300 felt cramped vs 1.png).
+    /// Match Maccy Defaults.windowSize (450×800).
     private static let defaultWidth: CGFloat = 450
-    private static let defaultHeight: CGFloat = 420
+    private static let defaultHeight: CGFloat = 800
 
     private enum Row {
         case item(ClipboardStore.Item)
@@ -26,6 +26,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     /// (that leaks the white square corners).
     private let rootView = NSView()
     private let effectView = NSVisualEffectView()
+    private let appTitleLabel = NSTextField(labelWithString: "PromptQy")
     private let searchField = NSTextField()
     private let searchIcon = NSImageView()
     private let clearSearchButton = NSButton()
@@ -36,6 +37,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     private let footerPrefs = FooterRowView()
     private let tipController = SelectionTooltipController()
     private var keyMonitor: Any?
+    private var scrollObserver: NSObjectProtocol?
     private var rows: [Row] = []
     private var filterWork: DispatchWorkItem?
     /// Index into `rows`; `-1` means nothing selected (open state).
@@ -70,12 +72,13 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         standardWindowButton(.closeButton)?.isHidden = true
         standardWindowButton(.miniaturizeButton)?.isHidden = true
         standardWindowButton(.zoomButton)?.isHidden = true
-        minSize = NSSize(width: 320, height: 220)
-        // Position-only persistence; width is forced on each open.
-        setFrameAutosaveName("PromptQyClipboardHistoryFrame.v5")
+        minSize = NSSize(width: 320, height: 280)
+        // Position-only persistence; size is forced on each open.
+        setFrameAutosaveName("PromptQyClipboardHistoryFrame.v6")
 
         buildContent()
         applyRoundedCorners()
+        observeScrollForHover()
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self, self.isKeyWindow else { return event }
@@ -86,6 +89,9 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     deinit {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
+        }
+        if let scrollObserver {
+            NotificationCenter.default.removeObserver(scrollObserver)
         }
     }
 
@@ -114,10 +120,10 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         searchField.stringValue = ""
         clearSearchButton.isHidden = true
         reload(query: "")
-        // Always enforce width — autosave was restoring a narrow frame.
+        // Always enforce Maccy-sized frame — autosave only keeps origin.
         var f = frame
         f.size.width = Self.defaultWidth
-        if f.size.height < 280 { f.size.height = Self.defaultHeight }
+        f.size.height = Self.defaultHeight
         setFrame(f, display: false)
         if !isVisible {
             positionNearMouse()
@@ -177,9 +183,17 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         ])
         contentView = rootView
 
+        // Maccy ListHeaderView: app name left of search, secondary color.
+        appTitleLabel.font = .systemFont(ofSize: 13)
+        appTitleLabel.textColor = .secondaryLabelColor
+        appTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        appTitleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        appTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+
         searchChrome.wantsLayer = true
         searchChrome.layer?.cornerRadius = Self.itemCorner
-        searchChrome.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.1).cgColor
+        // Maccy SearchFieldView: Color.secondary @ 0.1 — gray wash, not white.
+        searchChrome.layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.08).cgColor
         searchChrome.translatesAutoresizingMaskIntoConstraints = false
 
         searchIcon.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
@@ -257,6 +271,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
 
+        effectView.addSubview(appTitleLabel)
         effectView.addSubview(searchChrome)
         effectView.addSubview(scrollView)
         effectView.addSubview(divider)
@@ -264,10 +279,17 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         effectView.addSubview(footerPrefs)
 
         let inset = Self.contentInset
+        // List title text sits at inset + textInset; align "PromptQy" to that.
+        let titleLeading = inset + Self.textInset
         NSLayoutConstraint.activate([
+            appTitleLabel.leadingAnchor.constraint(equalTo: effectView.leadingAnchor, constant: titleLeading),
+            appTitleLabel.centerYAnchor.constraint(equalTo: searchChrome.centerYAnchor),
+
             searchChrome.topAnchor.constraint(equalTo: effectView.topAnchor, constant: Self.vPad + 4),
-            searchChrome.leadingAnchor.constraint(equalTo: effectView.leadingAnchor, constant: inset),
-            searchChrome.trailingAnchor.constraint(equalTo: effectView.trailingAnchor, constant: -inset),
+            searchChrome.leadingAnchor.constraint(equalTo: appTitleLabel.trailingAnchor, constant: 8),
+            // Match list/footer text trailing (inset + textInset).
+            searchChrome.trailingAnchor.constraint(
+                equalTo: effectView.trailingAnchor, constant: -(inset + Self.textInset)),
             searchChrome.heightAnchor.constraint(equalToConstant: 23),
 
             searchIcon.leadingAnchor.constraint(equalTo: searchChrome.leadingAnchor, constant: 6),
@@ -662,30 +684,64 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
                 guard let self, let cell else { return }
                 if hovering {
                     self.selectRowFromHover(cell)
-                    self.showTooltipForHover(item: item, anchor: cell)
-                    self.updateFooterLabels()
                 } else {
-                    cell.setHovered(false)
-                    self.tipController.hide(source: .hover)
-                    self.updateFooterLabels()
+                    // Scrolling often skips mouseExited — ignore stale exits;
+                    // only hide tip if this cell is still the selected one.
+                    let row = self.tableView.row(for: cell)
+                    if row == self.selectedRow {
+                        self.tipController.hide(source: .hover)
+                    }
                 }
             }
             return cell
         }
     }
 
+    /// During scroll, tracking areas often miss mouseExited/Entered — re-hit-test.
+    private func observeScrollForHover() {
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.syncHoverFromMouseLocation()
+        }
+    }
+
+    private func syncHoverFromMouseLocation() {
+        guard isVisible, let win = tableView.window else { return }
+        let screen = NSEvent.mouseLocation
+        let winPoint = win.convertPoint(fromScreen: screen)
+        let tablePoint = tableView.convert(winPoint, from: nil)
+        let row = tableView.row(at: tablePoint)
+        guard row >= 0, row < rows.count, case .item(let item) = rows[row] else { return }
+        guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ClipCellView else {
+            return
+        }
+        if selectedRow != row {
+            selectRowFromHover(cell)
+        } else {
+            showTooltipForHover(item: item, anchor: cell)
+        }
+    }
+
     /// Maccy-style: hover moves selection so the row gets accent fill.
+    /// Highlight is driven only by selection — never by a sticky isHovered flag
+    /// (scroll leaves mouseExited unfired and would keep multiple rows blue).
     private func selectRowFromHover(_ cell: ClipCellView) {
         let row = tableView.row(for: cell)
-        guard row >= 0, row < rows.count, case .item = rows[row] else { return }
+        guard row >= 0, row < rows.count, case .item(let item) = rows[row] else { return }
         if selectedRow != row {
             selectedRow = row
             tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             updateSelectionVisuals()
+            showTooltipForHover(item: item, anchor: cell)
+            updateFooterLabels()
         } else {
             cell.setSelected(true)
+            showTooltipForHover(item: item, anchor: cell)
         }
-        cell.setHovered(true)
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -778,16 +834,13 @@ private final class SelectionTooltipController {
         window?.orderOut(nil)
         window = nil
 
+        // Same as main panel: NEVER round NSVisualEffectView itself — that
+        // leaves white square corners. Size the vibrancy first, then wrap in
+        // a clear root and round contentView + theme-frame superview.
         let effect = NSVisualEffectView()
         effect.material = .popover
         effect.blendingMode = .behindWindow
         effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = ClipboardPanel.cornerRadius
-        effect.layer?.masksToBounds = true
-        if #available(macOS 10.15, *) {
-            effect.layer?.cornerCurve = .continuous
-        }
 
         switch content {
         case .text(let text):
@@ -823,6 +876,12 @@ private final class SelectionTooltipController {
         }
         let size = effect.fittingSize
         effect.frame = NSRect(origin: .zero, size: size)
+        effect.autoresizingMask = [.width, .height]
+
+        let root = NSView(frame: effect.frame)
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.clear.cgColor
+        root.addSubview(effect)
 
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
@@ -835,8 +894,9 @@ private final class SelectionTooltipController {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.contentView = effect
+        panel.contentView = root
         panel.isReleasedWhenClosed = false
+        Self.applyRoundedCorners(to: panel)
 
         let host = view.window ?? parent
         let inWindow = view.convert(view.bounds, to: nil)
@@ -859,8 +919,26 @@ private final class SelectionTooltipController {
         }
         panel.setFrameOrigin(origin)
         panel.orderFront(nil)
+        // Theme frame may appear after first layout — re-apply once visible.
+        DispatchQueue.main.async {
+            Self.applyRoundedCorners(to: panel)
+            panel.invalidateShadow()
+        }
         window = panel
         activeSource = source
+    }
+
+    private static func applyRoundedCorners(to panel: NSPanel) {
+        let radius = ClipboardPanel.cornerRadius
+        for view in [panel.contentView, panel.contentView?.superview].compactMap({ $0 }) {
+            view.wantsLayer = true
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+            view.layer?.cornerRadius = radius
+            view.layer?.masksToBounds = true
+            if #available(macOS 10.15, *) {
+                view.layer?.cornerCurve = .continuous
+            }
+        }
     }
 
     private static func fittedSize(for image: NSImage, maxSide: CGFloat) -> NSSize {
@@ -886,7 +964,6 @@ private final class ClipCellView: NSTableCellView {
     private let pinView = NSImageView()
     private let fill = NSView()
     private var isSelected = false
-    private var isHovered = false
     private var titleTrailingPinned: NSLayoutConstraint!
     private var titleTrailingPlain: NSLayoutConstraint!
     var onHover: ((Bool) -> Void)?
@@ -946,7 +1023,6 @@ private final class ClipCellView: NSTableCellView {
 
     func configure(item: ClipboardStore.Item, selected: Bool) {
         titleLabel.stringValue = item.preview
-        isHovered = false
         let pinned = item.pinned
         pinView.isHidden = !pinned
         titleTrailingPinned.isActive = pinned
@@ -959,13 +1035,10 @@ private final class ClipCellView: NSTableCellView {
         applyChrome()
     }
 
-    func setHovered(_ on: Bool) {
-        isHovered = on
-        applyChrome()
-    }
-
     private func applyChrome() {
-        if isSelected || isHovered {
+        // Selection alone drives highlight. A separate hover flag sticks when
+        // scroll skips mouseExited and paints multiple blue rows.
+        if isSelected {
             fill.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
             titleLabel.textColor = .white
             pinView.contentTintColor = .white
