@@ -37,6 +37,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     private let footerPrefs = FooterRowView()
     private let tipController = SelectionTooltipController()
     private var keyMonitor: Any?
+    private var mouseMonitor: Any?
     private var scrollObserver: NSObjectProtocol?
     private var rows: [Row] = []
     private var filterWork: DispatchWorkItem?
@@ -90,6 +91,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
         }
+        stopMouseMonitor()
         if let scrollObserver {
             NotificationCenter.default.removeObserver(scrollObserver)
         }
@@ -99,6 +101,10 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     override func cancelOperation(_ sender: Any?) { closePanel() }
     override func close() { closePanel() }
 
+    override func mouseExited(with event: NSEvent) {
+        clearHoverSelection()
+    }
+
     override func resignKey() {
         super.resignKey()
         if isVisible { closePanel() }
@@ -106,6 +112,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
 
     private func closePanel() {
         tipController.hide()
+        stopMouseMonitor()
         if searchField.currentEditor() != nil { endEditing(for: searchField) }
         makeFirstResponder(nil)
         ClipboardStore.clearThumbnailCache()
@@ -133,6 +140,27 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         makeFirstResponder(searchField)
         tipController.hide()
         applyRoundedCorners()
+        startMouseMonitor()
+    }
+
+    /// Track pointer while open so empty list space / panel exit clears highlight
+    /// (cell tracking alone misses “keyboard-selected → move into blank”).
+    private func startMouseMonitor() {
+        stopMouseMonitor()
+        acceptsMouseMovedEvents = true
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
+            // Same-row moves must not restart the tip delay.
+            self?.syncHoverFromMouseLocation(refreshTipIfSameRow: false)
+            return event
+        }
+    }
+
+    private func stopMouseMonitor() {
+        if let mouseMonitor {
+            NSEvent.removeMonitor(mouseMonitor)
+            self.mouseMonitor = nil
+        }
+        acceptsMouseMovedEvents = false
     }
 
     private func positionNearMouse() {
@@ -277,6 +305,14 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         effectView.addSubview(divider)
         effectView.addSubview(footerClear)
         effectView.addSubview(footerPrefs)
+
+        // Whole-panel exit (search / footer / empty list) — cell tracking alone
+        // does not fire when the pointer leaves from non-row chrome.
+        rootView.addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil))
 
         let inset = Self.contentInset
         // List title text sits at inset + textInset; align "PromptQy" to that.
@@ -685,12 +721,10 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
                 if hovering {
                     self.selectRowFromHover(cell)
                 } else {
-                    // Scrolling often skips mouseExited — ignore stale exits;
-                    // only hide tip if this cell is still the selected one.
-                    let row = self.tableView.row(for: cell)
-                    if row == self.selectedRow {
-                        self.tipController.hide(source: .hover)
-                    }
+                    // Re-hit-test: moving to another row selects it; leaving the
+                    // list / empty area below the last item clears highlight.
+                    // (Stale exits during scroll are corrected by the same path.)
+                    self.syncHoverFromMouseLocation()
                 }
             }
             return cell
@@ -705,25 +739,44 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
-            self?.syncHoverFromMouseLocation()
+            self?.syncHoverFromMouseLocation(refreshTipIfSameRow: true)
         }
     }
 
-    private func syncHoverFromMouseLocation() {
-        guard isVisible, let win = tableView.window else { return }
+    private func syncHoverFromMouseLocation(refreshTipIfSameRow: Bool = false) {
+        guard isVisible else { return }
         let screen = NSEvent.mouseLocation
+        // Outside the panel, or over search / footer / empty list space → clear.
+        guard NSMouseInRect(screen, frame, false) else {
+            clearHoverSelection()
+            return
+        }
+        guard let win = tableView.window else { return }
         let winPoint = win.convertPoint(fromScreen: screen)
         let tablePoint = tableView.convert(winPoint, from: nil)
         let row = tableView.row(at: tablePoint)
-        guard row >= 0, row < rows.count, case .item(let item) = rows[row] else { return }
+        guard row >= 0, row < rows.count, case .item(let item) = rows[row],
+              tableView.bounds.contains(tablePoint) else {
+            clearHoverSelection()
+            return
+        }
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ClipCellView else {
             return
         }
         if selectedRow != row {
             selectRowFromHover(cell)
-        } else {
+        } else if refreshTipIfSameRow {
             showTooltipForHover(item: item, anchor: cell)
         }
+    }
+
+    /// Drop list highlight when the pointer leaves items (empty area / panel exit).
+    private func clearHoverSelection() {
+        tipController.hide(source: .hover)
+        guard selectedRow >= 0 else { return }
+        selectedRow = -1
+        tableView.deselectAll(nil)
+        updateSelectionVisuals()
     }
 
     /// Maccy-style: hover moves selection so the row gets accent fill.
