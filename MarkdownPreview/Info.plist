@@ -30,6 +30,7 @@
 				<string>net.daringfireball.markdown.strict</string>
 				<string>org.vim.markdown</string>
 				<string>io.github.promptqy.sheet</string>
+				<string>public.yaml</string>
 			</array>
 			<key>QLSupportsSearchableItems</key>
 			<false/>

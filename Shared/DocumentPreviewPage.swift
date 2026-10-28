@@ -4,7 +4,7 @@ import Foundation
 /// Shared HTML shell for notes preview + Quick Look. GitHub-flavored light/dark
 /// styling (no syntax highlighting), matching the target Space-preview look.
 enum DocumentPreviewPage {
-    static let supportedExtensions: Set<String> = ["md", "markdown", "sheet"]
+    static let supportedExtensions: Set<String> = ["md", "markdown", "sheet", "yaml", "yml"]
 
     /// Preferred Quick Look window size as a fraction of the main display.
     static func preferredPreviewSize(
@@ -30,6 +30,9 @@ enum DocumentPreviewPage {
         let raw = try readFile(at: url)
         let ext = url.pathExtension.lowercased()
         if ext == "sheet" { return SheetHTML.render(raw) }
+        if ext == "yaml" || ext == "yml" {
+            return "<pre><code>\(HTMLEscape.escape(raw))</code></pre>"
+        }
         return MarkdownHTML.render(raw)
     }
 
