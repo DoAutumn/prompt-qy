@@ -75,6 +75,14 @@ gh release create "$TAG" "$ZIP" --repo "$GH_REPO" --generate-notes
 # The cask pins a checksum, so it must be recomputed from the exact artifact the
 # release serves. Hash the local zip — it is byte-identical to what was uploaded.
 SHA="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
+
+# Zip is on GitHub now; drop local dist/ (.app / .zip / logs) so Spotlight does
+# not keep serving duplicate PromptQy hits next to /Applications.
+echo "==> Cleaning dist/"
+rm -rf "$ROOT/dist"
+# Xcode IDE builds leave another copy under DerivedData — same Spotlight noise.
+rm -rf "$HOME/Library/Developer/Xcode/DerivedData/PromptQy-"*
+
 echo "==> Writing cask $CASK_TOKEN $VERSION ($SHA)"
 cat > "$CASK" <<CASK
 cask "$CASK_TOKEN" do

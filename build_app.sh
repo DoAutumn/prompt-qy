@@ -73,6 +73,9 @@ BUILT="$DERIVED/Build/Products/Release/$APP_NAME.app"
 [ -d "$BUILT" ] || { echo "!! build product missing: $BUILT" >&2; exit 1; }
 rm -rf "$APP"
 cp -R "$BUILT" "$APP"
+# Drop DerivedData immediately — it holds a second PromptQy.app + .dSYM that
+# Spotlight indexes alongside dist/PromptQy.app. The signed copy in dist/ is enough.
+rm -rf "$DERIVED"
 
 # Prefer a stable self-signed identity (see setup_signing.sh) so TCC grants
 # survive rebuilds; fall back to ad-hoc otherwise. Sign nested appexes first.
