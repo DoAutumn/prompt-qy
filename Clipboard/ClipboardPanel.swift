@@ -44,6 +44,9 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     /// Index into `rows`; `-1` means nothing selected (open state).
     private var selectedRow = -1
     private var optionHeld = false
+    /// Hover must not steal the open-time default selection until the pointer moves.
+    private var hoverArmed = false
+    private var openMouseLocation: NSPoint?
 
     var onInsertIntoEditor: ((String) -> Void)?
     var onOpenSettings: (() -> Void)?
@@ -113,6 +116,8 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     private func closePanel() {
         tipController.hide()
         stopMouseMonitor()
+        hoverArmed = false
+        openMouseLocation = nil
         if searchField.currentEditor() != nil { endEditing(for: searchField) }
         makeFirstResponder(nil)
         ClipboardStore.clearThumbnailCache()
@@ -126,7 +131,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
     func showAndFocus() {
         searchField.stringValue = ""
         clearSearchButton.isHidden = true
-        reload(query: "")
+        reload(query: "", selectFirstUnpinned: true)
         // Always enforce Maccy-sized frame — autosave only keeps origin.
         var f = frame
         f.size.width = Self.defaultWidth
@@ -138,8 +143,10 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         orderFrontRegardless()
         makeKey()
         makeFirstResponder(searchField)
-        tipController.hide()
         applyRoundedCorners()
+        // Snapshot after layout so idle cursor over the list does not re-select.
+        hoverArmed = false
+        openMouseLocation = NSEvent.mouseLocation
         startMouseMonitor()
     }
 
@@ -153,6 +160,21 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
             self?.syncHoverFromMouseLocation(refreshTipIfSameRow: false)
             return event
         }
+    }
+
+    /// Arm hover only after a real pointer move from the open-time location.
+    @discardableResult
+    private func armHoverIfMouseMoved() -> Bool {
+        if hoverArmed { return true }
+        let now = NSEvent.mouseLocation
+        if let origin = openMouseLocation {
+            let dx = abs(now.x - origin.x)
+            let dy = abs(now.y - origin.y)
+            if dx < 3, dy < 3 { return false }
+        }
+        hoverArmed = true
+        openMouseLocation = nil
+        return true
     }
 
     private func stopMouseMonitor() {
@@ -381,19 +403,28 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         rows = next
     }
 
-    private func reload(query: String) {
+    private func reload(query: String, selectFirstUnpinned: Bool = false) {
         let items = ClipboardStore.filtered(query: query)
         rebuildRows(from: items)
         tableView.reloadData()
         tableView.sizeLastColumnToFit()
-        // Open / refresh: no selection (Maccy keeps search focused, list idle).
-        selectedRow = -1
-        tableView.deselectAll(nil)
+        if selectFirstUnpinned, let row = firstUnpinnedItemRow() {
+            selectedRow = row
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            selectedRow = -1
+            tableView.deselectAll(nil)
+        }
         updateFooterLabels()
         tipController.hide()
         DispatchQueue.main.async { [weak self] in
-            self?.tableView.sizeLastColumnToFit()
-            self?.updateSelectionVisuals()
+            guard let self else { return }
+            self.tableView.sizeLastColumnToFit()
+            self.updateSelectionVisuals()
+            if selectFirstUnpinned, self.selectedRow >= 0 {
+                self.tableView.scrollRowToVisible(self.selectedRow)
+                self.showTooltipForSelection()
+            }
         }
     }
 
@@ -401,6 +432,21 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         rows.firstIndex {
             if case .item = $0 { return true }
             return false
+        }
+    }
+
+    /// First history item below the pinned section (skip pins + separator).
+    private func firstUnpinnedItemRow() -> Int? {
+        rows.firstIndex {
+            if case .item(let item) = $0 { return !item.pinned }
+            return false
+        }
+    }
+
+    private func pinnedItemsInOrder() -> [ClipboardStore.Item] {
+        rows.compactMap {
+            if case .item(let item) = $0, item.pinned { return item }
+            return nil
         }
     }
 
@@ -437,6 +483,12 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
 
         let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let key = event.keyCode
+
+        // ⌘1…⌘9 (main row + keypad) → paste that pinned item.
+        if flags == .command, let pinIndex = Self.commandDigitIndex(keyCode: key, event: event) {
+            activatePinned(at: pinIndex)
+            return nil
+        }
 
         if key == 36 || key == 76 { // Return
             if flags.contains(.option) {
@@ -585,6 +637,33 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
         closePanel()
     }
 
+    /// 0-based index for ⌘1…⌘9 from main digit keys or numeric keypad.
+    private static func commandDigitIndex(keyCode: UInt16, event: NSEvent) -> Int? {
+        // Main keyboard 1…9 (ANSI).
+        let main: [UInt16: Int] = [
+            18: 0, 19: 1, 20: 2, 21: 3, 23: 4, 22: 5, 26: 6, 28: 7, 25: 8,
+        ]
+        // Keypad 1…9.
+        let pad: [UInt16: Int] = [
+            83: 0, 84: 1, 85: 2, 86: 3, 87: 4, 88: 5, 89: 6, 91: 7, 92: 8,
+        ]
+        if let i = main[keyCode] ?? pad[keyCode] { return i }
+        // Layout-agnostic fallback (also covers some IME / remapped cases).
+        guard let ch = event.charactersIgnoringModifiers?.first,
+              let n = Int(String(ch)), (1...9).contains(n) else { return nil }
+        return n - 1
+    }
+
+    private func activatePinned(at index: Int) {
+        let pinned = pinnedItemsInOrder()
+        guard index < pinned.count else {
+            NSSound.beep()
+            return
+        }
+        ClipboardPasteboard.copy(pinned[index])
+        closePanel()
+    }
+
     private func activateInsert() {
         guard let item = selectedItem() else { return }
         switch item.kind {
@@ -715,9 +794,13 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
             let id = NSUserInterfaceItemIdentifier("ClipCell")
             let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? ClipCellView) ?? ClipCellView()
             cell.identifier = id
-            cell.configure(item: item, selected: row == selectedRow)
+            // Pinned rows are always contiguous at the top, so index == row.
+            let pinShortcut: String? = item.pinned && row < 9 ? "⌘\(row + 1)" : nil
+            cell.configure(item: item, selected: row == selectedRow, pinShortcut: pinShortcut)
             cell.onHover = { [weak self, weak cell] hovering in
                 guard let self, let cell else { return }
+                // Ignore enter/exit from the panel appearing under a still cursor.
+                guard self.armHoverIfMouseMoved() else { return }
                 if hovering {
                     self.selectRowFromHover(cell)
                 } else {
@@ -745,6 +828,7 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
 
     private func syncHoverFromMouseLocation(refreshTipIfSameRow: Bool = false) {
         guard isVisible else { return }
+        guard armHoverIfMouseMoved() else { return }
         let screen = NSEvent.mouseLocation
         // Outside the panel, or over search / footer / empty list space → clear.
         guard NSMouseInRect(screen, frame, false) else {
@@ -772,6 +856,8 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
 
     /// Drop list highlight when the pointer leaves items (empty area / panel exit).
     private func clearHoverSelection() {
+        // Keep the open-time / keyboard selection until the user moves the mouse.
+        guard hoverArmed else { return }
         tipController.hide(source: .hover)
         guard selectedRow >= 0 else { return }
         selectedRow = -1
@@ -1014,10 +1100,12 @@ private final class ClipRowView: NSTableRowView {
 
 private final class ClipCellView: NSTableCellView {
     private let titleLabel = NSTextField(labelWithString: "")
+    private let shortcutLabel = NSTextField(labelWithString: "")
     private let pinView = NSImageView()
     private let fill = NSView()
     private var isSelected = false
-    private var titleTrailingPinned: NSLayoutConstraint!
+    private var titleTrailingToShortcut: NSLayoutConstraint!
+    private var titleTrailingToPin: NSLayoutConstraint!
     private var titleTrailingPlain: NSLayoutConstraint!
     var onHover: ((Bool) -> Void)?
 
@@ -1036,6 +1124,13 @@ private final class ClipCellView: NSTableCellView {
         titleLabel.font = .systemFont(ofSize: 13)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        shortcutLabel.font = .systemFont(ofSize: 11)
+        shortcutLabel.textColor = .tertiaryLabelColor
+        shortcutLabel.translatesAutoresizingMaskIntoConstraints = false
+        shortcutLabel.setContentHuggingPriority(.required, for: .horizontal)
+        shortcutLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        shortcutLabel.isHidden = true
+
         let pin = NSImage(
             systemSymbolName: "pin.fill",
             accessibilityDescription: "已固定")
@@ -1047,10 +1142,14 @@ private final class ClipCellView: NSTableCellView {
 
         addSubview(fill)
         addSubview(titleLabel)
+        addSubview(shortcutLabel)
         addSubview(pinView)
         textField = titleLabel
 
-        titleTrailingPinned = titleLabel.trailingAnchor.constraint(
+        // title … ⌘1 📌  /  title … 📌  /  title
+        titleTrailingToShortcut = titleLabel.trailingAnchor.constraint(
+            equalTo: shortcutLabel.leadingAnchor, constant: -6)
+        titleTrailingToPin = titleLabel.trailingAnchor.constraint(
             equalTo: pinView.leadingAnchor, constant: -6)
         titleTrailingPlain = titleLabel.trailingAnchor.constraint(
             equalTo: trailingAnchor, constant: -ClipboardPanel.textInset)
@@ -1065,6 +1164,9 @@ private final class ClipCellView: NSTableCellView {
             titleTrailingPlain,
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
+            shortcutLabel.trailingAnchor.constraint(equalTo: pinView.leadingAnchor, constant: -4),
+            shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
             pinView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -ClipboardPanel.textInset),
             pinView.centerYAnchor.constraint(equalTo: centerYAnchor),
             pinView.widthAnchor.constraint(equalToConstant: 10),
@@ -1074,12 +1176,29 @@ private final class ClipCellView: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:)") }
 
-    func configure(item: ClipboardStore.Item, selected: Bool) {
+    func configure(item: ClipboardStore.Item, selected: Bool, pinShortcut: String? = nil) {
         titleLabel.stringValue = item.preview
         let pinned = item.pinned
         pinView.isHidden = !pinned
-        titleTrailingPinned.isActive = pinned
-        titleTrailingPlain.isActive = !pinned
+        let showShortcut = pinned && pinShortcut != nil
+        if let pinShortcut, showShortcut {
+            shortcutLabel.stringValue = pinShortcut
+            shortcutLabel.isHidden = false
+        } else {
+            shortcutLabel.stringValue = ""
+            shortcutLabel.isHidden = true
+        }
+        // Deactivate first so title never has two trailing constraints at once.
+        titleTrailingToShortcut.isActive = false
+        titleTrailingToPin.isActive = false
+        titleTrailingPlain.isActive = false
+        if showShortcut {
+            titleTrailingToShortcut.isActive = true
+        } else if pinned {
+            titleTrailingToPin.isActive = true
+        } else {
+            titleTrailingPlain.isActive = true
+        }
         setSelected(selected)
     }
 
@@ -1094,10 +1213,12 @@ private final class ClipCellView: NSTableCellView {
         if isSelected {
             fill.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
             titleLabel.textColor = .white
+            shortcutLabel.textColor = NSColor.white.withAlphaComponent(0.55)
             pinView.contentTintColor = .white
         } else {
             fill.layer?.backgroundColor = NSColor.clear.cgColor
             titleLabel.textColor = .labelColor
+            shortcutLabel.textColor = .tertiaryLabelColor
             pinView.contentTintColor = .secondaryLabelColor
         }
     }
