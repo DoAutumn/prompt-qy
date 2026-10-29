@@ -15,7 +15,7 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Double-tap Control to summon**: inserts the frontmost app's selection (Accessibility API first, falls back to a synthesized ⌘C)
 - **Drag files in** to insert their paths
 - **Double-tap Option** to search Markdown / `.sheet` notes (Obsidian vault etc.): floating always-on-top panel with Markdown or spreadsheet table preview (select/copy, jumps to the first match); vault path and exclude dirs in Settings
-- **Finder Quick Look** for `.md` / `.markdown` / `.sheet` (rendered) and `.yaml` / `.yml` (monospace source); text-page thumbnails like `.js` / `.json`
+- **Finder Quick Look** for `.md` / `.markdown` / `.sheet` (rendered) and `.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss` (monospace source); text-page thumbnails like `.js` / `.json`
 - **Double-tap Command** to open the current Finder selection in Sublime Text
 - **Screenshot auto-insert**: after ⌘⇧4, the new screenshot's path is inserted (menu → *Insert screenshots immediately* disables macOS's floating thumbnail so captures save — and insert — with no ~5s delay)
 - **Voice dictation**: hold right Option to start recording (real-time streaming recognition), release to stop; a red pulsing dot + "录音中…" indicator appears in the bottom bar. Transcription appears live at the cursor and finalizes on release. Powered by macOS's native SFSpeechRecognizer — no external dependencies
@@ -83,9 +83,9 @@ cp -R "dist/PromptQy.app" /Applications/   # install to Applications
 
 Building locally means the app has **no quarantine flag**, so Gatekeeper won't block it.
 
-## Quick Look (Markdown / `.sheet` / YAML)
+## Quick Look (Markdown / `.sheet` / source)
 
-After install, **open PromptQy once** so macOS registers its Quick Look extensions. Then in Finder select a `.md` / `.markdown` / `.sheet` / `.yaml` / `.yml` file and press **Space**.
+After install, **open PromptQy once** so macOS registers its Quick Look extensions. Then in Finder select a `.md` / `.markdown` / `.sheet` / `.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss` file and press **Space**.
 
 If Space still shows plain text (or another Markdown previewer wins):
 
@@ -93,7 +93,7 @@ If Space still shows plain text (or another Markdown previewer wins):
 2. Enable **PromptQy Markdown Preview** and **PromptQy Markdown Thumbnail**
 3. If several Markdown preview extensions are on, turn off the others (only one can win per file type)
 
-Space preview styling follows light/dark appearance; notes search (double-tap Option) uses the same stylesheet. `.yaml` / `.yml` Space preview is monospace source (no syntax highlighting). Finder thumbnails for `.md` / `.markdown` / `.yaml` / `.yml` use the **system** text generator (same family as `.js` / `.json`); PromptQy only supplies thumbnails for `.sheet`.
+Space preview styling follows light/dark appearance; notes search (double-tap Option) uses the same stylesheet. Source files (`.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss`) use monospace Space preview (no syntax highlighting). macOS types `.ts` as MPEG-TS, so PromptQy claims that UTI and only renders text-like files (binary MPEG-TS fails fast on a small header read; Movie Quick Look does not take over afterward). `.less` / `.sass` / `.scss` need PromptQy opened once so Launch Services picks up the exported UTIs. Finder thumbnails for markdown / YAML use the **system** text generator (same family as `.js` / `.json`); PromptQy only supplies thumbnails for `.sheet`.
 
 ## Permissions
 

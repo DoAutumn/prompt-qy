@@ -64,6 +64,10 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         expectedNavigation = nil
 
         do {
+            let ext = url.pathExtension.lowercased()
+            guard DocumentPreviewPage.supportedExtensions.contains(ext) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
             let html = try DocumentPreviewPage.fullHTML(forFileAt: url)
             let base = url.deletingLastPathComponent()
             expectedNavigation = webView.loadHTMLString(html, baseURL: base)

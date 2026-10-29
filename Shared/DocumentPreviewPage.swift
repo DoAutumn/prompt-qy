@@ -4,7 +4,15 @@ import Foundation
 /// Shared HTML shell for notes preview + Quick Look. GitHub-flavored light/dark
 /// styling (no syntax highlighting), matching the target Space-preview look.
 enum DocumentPreviewPage {
-    static let supportedExtensions: Set<String> = ["md", "markdown", "sheet", "yaml", "yml"]
+    /// Monospace source preview (no syntax highlighting) — same shell as YAML.
+    static let sourceCodeExtensions: Set<String> = [
+        "yaml", "yml",
+        "ts", "tsx",
+        "less", "sass", "scss",
+    ]
+
+    static let supportedExtensions: Set<String> =
+        Set(["md", "markdown", "sheet"]).union(sourceCodeExtensions)
 
     /// Preferred Quick Look window size as a fraction of the main display.
     static func preferredPreviewSize(
@@ -20,9 +28,61 @@ enum DocumentPreviewPage {
     }
 
     static func readFile(at url: URL) throws -> String {
+        let ext = url.pathExtension.lowercased()
+        // macOS types `.ts` as MPEG-TS; we claim that UTI for TypeScript. Fail
+        // fast on binary transport streams (header only) — QL will not hand off
+        // to Movie.qlgenerator after we claim the type.
+        if ext == "ts" {
+            let header = try readPrefix(of: url, maxLength: 188 * 5)
+            if isLikelyMPEGTransportStream(header), !isLikelyText(header) {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        }
+
+        if sourceCodeExtensions.contains(ext) {
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard isLikelyText(data) else { throw CocoaError(.fileReadCorruptFile) }
+            if let s = String(data: data, encoding: .utf8) { return s }
+            if let s = String(data: data, encoding: .isoLatin1) { return s }
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
         if let s = try? String(contentsOf: url, encoding: .utf8) { return s }
         if let s = try? String(contentsOf: url, encoding: .isoLatin1) { return s }
         throw CocoaError(.fileReadCorruptFile)
+    }
+
+    private static func readPrefix(of url: URL, maxLength: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        return try handle.read(upToCount: maxLength) ?? Data()
+    }
+
+    /// MPEG-TS packets start with sync byte 0x47 every 188 bytes.
+    private static func isLikelyMPEGTransportStream(_ data: Data) -> Bool {
+        guard data.count >= 188 else { return false }
+        let packets = min(5, data.count / 188)
+        for i in 0..<packets where data[i * 188] != 0x47 {
+            return false
+        }
+        return true
+    }
+
+    /// Reject obvious binary (NUL / high control-byte ratio) before Latin-1 dump.
+    private static func isLikelyText(_ data: Data) -> Bool {
+        if data.isEmpty { return true }
+        let sample = data.prefix(8192)
+        var control = 0
+        for byte in sample {
+            if byte == 0 { return false }
+            // Allow tab / LF / CR; count other C0 controls + DEL.
+            if byte < 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D {
+                control += 1
+            } else if byte == 0x7F {
+                control += 1
+            }
+        }
+        return Double(control) / Double(sample.count) < 0.30
     }
 
     /// Render file contents to body HTML (no outer document).
@@ -30,7 +90,7 @@ enum DocumentPreviewPage {
         let raw = try readFile(at: url)
         let ext = url.pathExtension.lowercased()
         if ext == "sheet" { return SheetHTML.render(raw) }
-        if ext == "yaml" || ext == "yml" {
+        if sourceCodeExtensions.contains(ext) {
             return "<pre><code>\(HTMLEscape.escape(raw))</code></pre>"
         }
         return MarkdownHTML.render(raw)

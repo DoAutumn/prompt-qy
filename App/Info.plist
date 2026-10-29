@@ -34,6 +34,67 @@
 	<string>语音识别用于将口述内容实时转写并录入编辑器。</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>麦克风仅在按住语音键录音时使用，用于将口述内容转写为文字。</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>TypeScript Source</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.microsoft.typescript</string>
+				<string>public.mpeg-2-transport-stream</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>ts</string>
+				<string>tsx</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>LESS Stylesheet</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.promptqy.less</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>less</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Sass Stylesheet</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.promptqy.sass</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>sass</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>SCSS Stylesheet</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.promptqy.scss</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>scss</string>
+			</array>
+		</dict>
+	</array>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>
@@ -53,6 +114,29 @@
 					<string>markdown</string>
 					<string>mdown</string>
 					<string>mkd</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.microsoft.typescript</string>
+			<key>UTTypeDescription</key>
+			<string>TypeScript Source</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>ts</string>
+					<string>tsx</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>text/typescript</string>
 				</array>
 			</dict>
 		</dict>
@@ -78,6 +162,72 @@
 				<key>public.mime-type</key>
 				<array>
 					<string>application/json</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.promptqy.less</string>
+			<key>UTTypeDescription</key>
+			<string>LESS Stylesheet</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>less</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>text/x-less</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.promptqy.sass</string>
+			<key>UTTypeDescription</key>
+			<string>Sass Stylesheet</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>sass</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>text/x-sass</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.promptqy.scss</string>
+			<key>UTTypeDescription</key>
+			<string>SCSS Stylesheet</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>scss</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>text/x-scss</string>
 				</array>
 			</dict>
 		</dict>

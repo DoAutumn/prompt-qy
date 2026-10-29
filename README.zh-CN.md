@@ -15,7 +15,7 @@
 - **双击 Control 呼出**：若前台有选中文本，自动插入到光标处（先走辅助功能 API，取不到再回退合成 ⌘C）
 - **拖文件进编辑器**：插入文件路径
 - **双击 Option 搜索笔记**（Obsidian 等 Markdown / `.sheet` 表格库）：置顶浮层，Markdown / 表格预览可框选复制并定位到匹配处；库路径与排除目录可在设置中配置
-- **Finder 空格预览**：支持 `.md` / `.markdown` / `.sheet` 渲染预览，以及 `.yaml` / `.yml` 等宽源码预览；缩略图与 `.js` / `.json` 同类白底文本页
+- **Finder 空格预览**：支持 `.md` / `.markdown` / `.sheet` 渲染预览，以及 `.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss` 等宽源码预览；缩略图与 `.js` / `.json` 同类白底文本页
 - **双击 Command 用 Sublime Text 打开** Finder 当前选中的文件
 - **截图自动插路径**：⌘⇧4 截图后，把新截图路径插进编辑器（菜单里的「截图后立即插入」可关闭 macOS 悬浮缩略图，让截图即存即插，省去约 5 秒等待）
 - **语音录入**：按住右 Option 开始录音（实时流式识别），松手停止；底部栏有红色脉冲圆点 +「录音中…」指示。识别结果实时出现在编辑器光标位置，松开后自动定稿。基于 macOS 原生 SFSpeechRecognizer，支持中英混合
@@ -83,9 +83,9 @@ cp -R "dist/PromptQy.app" /Applications/   # 安装到应用程序
 
 本地构建的 App **没有 quarantine 标记**，Gatekeeper 不会拦。
 
-## Quick Look（Markdown / `.sheet` / YAML）
+## Quick Look（Markdown / `.sheet` / 源码）
 
-安装后请**先打开一次 PromptQy**，让系统注册扩展。然后在 Finder 中选中 `.md` / `.markdown` / `.sheet` / `.yaml` / `.yml` 文件，按 **空格** 预览。
+安装后请**先打开一次 PromptQy**，让系统注册扩展。然后在 Finder 中选中 `.md` / `.markdown` / `.sheet` / `.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss` 文件，按 **空格** 预览。
 
 若空格仍是纯文本（或被其它 Markdown 预览扩展抢走）：
 
@@ -93,7 +93,7 @@ cp -R "dist/PromptQy.app" /Applications/   # 安装到应用程序
 2. 启用 **PromptQy Markdown Preview** 与 **PromptQy Markdown Thumbnail**
 3. 若同时开着其它 Markdown 预览扩展，请关掉它们（同一文件类型只能有一个生效）
 
-空格预览样式跟随浅色/深色外观；双击 Option 的笔记预览使用同一套样式。`.yaml` / `.yml` 空格预览为等宽源码（无语法高亮）。`.md` / `.markdown` / `.yaml` / `.yml` 的 Finder 缩略图走**系统**文本缩略图（与 `.js` / `.json` 同类）；PromptQy 仅为 `.sheet` 提供缩略图。
+空格预览样式跟随浅色/深色外观；双击 Option 的笔记预览使用同一套样式。源码类（`.yaml` / `.yml` / `.ts` / `.tsx` / `.less` / `.sass` / `.scss`）空格预览为等宽源码（无语法高亮）。macOS 会把 `.ts` 标成 MPEG-TS，因此 PromptQy 认领该 UTI，仅渲染像文本的文件（二进制 MPEG-TS 只读一小段文件头后快速失败；之后不会交给 Movie 预览）。`.less` / `.sass` / `.scss` 需先打开一次 PromptQy，让 Launch Services 注册导出的 UTI。`.md` / `.markdown` / `.yaml` / `.yml` 的 Finder 缩略图走**系统**文本缩略图（与 `.js` / `.json` 同类）；PromptQy 仅为 `.sheet` 提供缩略图。
 
 ## 关于权限
 

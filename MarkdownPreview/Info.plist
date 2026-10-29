@@ -31,6 +31,12 @@
 				<string>org.vim.markdown</string>
 				<string>io.github.promptqy.sheet</string>
 				<string>public.yaml</string>
+				<!-- .ts → MPEG-TS UTI; header-sniff text vs binary (no Movie handoff if we fail). -->
+				<string>public.mpeg-2-transport-stream</string>
+				<string>com.microsoft.typescript</string>
+				<string>io.github.promptqy.less</string>
+				<string>io.github.promptqy.sass</string>
+				<string>io.github.promptqy.scss</string>
 			</array>
 			<key>QLSupportsSearchableItems</key>
 			<false/>
