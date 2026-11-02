@@ -152,6 +152,20 @@ enum ClipboardStore {
         return try? String(contentsOf: payloadURL(item), encoding: .utf8)
     }
 
+    /// Prefix-only read for UI tips — never pull the full payload onto the main thread.
+    static func loadTextPrefix(_ item: Item, maxBytes: Int) -> (text: String, truncated: Bool)? {
+        guard item.kind == .text, maxBytes > 0 else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: payloadURL(item)) else { return nil }
+        defer { try? handle.close() }
+        // +1 so we know whether more content remains without a second stat.
+        guard let data = try? handle.read(upToCount: maxBytes + 1), !data.isEmpty else {
+            return ("", false)
+        }
+        let truncated = data.count > maxBytes
+        let slice = truncated ? data.prefix(maxBytes) : data[...]
+        return (String(decoding: slice, as: UTF8.self), truncated)
+    }
+
     static func loadImageData(_ item: Item) -> Data? {
         guard item.kind == .image else { return nil }
         return try? Data(contentsOf: payloadURL(item))

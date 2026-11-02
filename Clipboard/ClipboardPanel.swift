@@ -597,13 +597,24 @@ final class ClipboardPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource,
             let fallback = item.preview.trimmingCharacters(in: .whitespacesAndNewlines)
             return fallback.isEmpty ? nil : .text(fallback)
         case .text:
-            let text = (ClipboardStore.loadText(item) ?? item.preview)
+            // Never load/layout the full payload (up to 256KB) — wrapping NSTextField
+            // + fittingSize on that freezes the UI on select/hover.
+            let loaded = ClipboardStore.loadTextPrefix(item, maxBytes: SelectionTooltipController.maxTipTextBytes)
+            var text = (loaded?.text ?? item.preview)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
-            // Path-only clips (legacy / mis-captured Finder copies) → show file image.
-            if ClipboardMonitor.isImageFilePath(text),
+            // Path-only clips are short; skip the check on large bodies.
+            if item.byteLength < 1024,
+               ClipboardMonitor.isImageFilePath(text),
                let img = NSImage(contentsOf: URL(fileURLWithPath: (text as NSString).expandingTildeInPath)) {
                 return .image(img)
+            }
+            let truncated = (loaded?.truncated == true) || text.count > SelectionTooltipController.maxTipTextChars
+            if text.count > SelectionTooltipController.maxTipTextChars {
+                text = String(text.prefix(SelectionTooltipController.maxTipTextChars))
+            }
+            if truncated {
+                text = text.trimmingCharacters(in: .whitespacesAndNewlines) + "\n…"
             }
             return .text(text)
         }
@@ -932,6 +943,10 @@ private final class SelectionTooltipController {
     private static let maxTextWidth: CGFloat = 360
     private static let maxImageSide: CGFloat = 520
     private static let pad: CGFloat = 10
+    /// Hard caps so tip layout stays cheap even if a caller passes a huge string.
+    static let maxTipTextBytes = 8_192
+    static let maxTipTextChars = 2_500
+    private static let maxTextHeight: CGFloat = 480
 
     func hide() {
         work?.cancel()
@@ -983,11 +998,20 @@ private final class SelectionTooltipController {
 
         switch content {
         case .text(let text):
-            let label = NSTextField(wrappingLabelWithString: text)
+            // Defensive truncate — callers should already cap, but layout cost is O(n).
+            let shown: String
+            if text.count > Self.maxTipTextChars {
+                shown = String(text.prefix(Self.maxTipTextChars)) + "\n…"
+            } else {
+                shown = text
+            }
+            let label = NSTextField(wrappingLabelWithString: shown)
             label.font = .systemFont(ofSize: 12)
             label.textColor = .labelColor
             label.drawsBackground = false
             label.preferredMaxLayoutWidth = Self.maxTextWidth - Self.pad * 2
+            label.maximumNumberOfLines = 0
+            label.cell?.truncatesLastVisibleLine = true
             label.translatesAutoresizingMaskIntoConstraints = false
             effect.addSubview(label)
             NSLayoutConstraint.activate([
@@ -996,6 +1020,7 @@ private final class SelectionTooltipController {
                 label.leadingAnchor.constraint(equalTo: effect.leadingAnchor, constant: Self.pad),
                 label.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -Self.pad),
                 label.widthAnchor.constraint(lessThanOrEqualToConstant: Self.maxTextWidth - Self.pad * 2),
+                label.heightAnchor.constraint(lessThanOrEqualToConstant: Self.maxTextHeight),
             ])
         case .image(let image):
             let fitted = Self.fittedSize(for: image, maxSide: Self.maxImageSide)
@@ -1013,7 +1038,8 @@ private final class SelectionTooltipController {
                 imageView.heightAnchor.constraint(equalToConstant: fitted.height),
             ])
         }
-        let size = effect.fittingSize
+        var size = effect.fittingSize
+        size.height = min(size.height, Self.maxTextHeight + Self.pad * 2)
         effect.frame = NSRect(origin: .zero, size: size)
         effect.autoresizingMask = [.width, .height]
 
