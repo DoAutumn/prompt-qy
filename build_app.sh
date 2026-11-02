@@ -24,6 +24,11 @@ echo "==> Version $VERSION (macOS $DEPLOYMENT_TARGET)"
 rm -rf "$APP" "$ICONSET" "$DERIVED"
 mkdir -p "$ROOT/dist" "$ROOT/App"
 
+# Keep project.yml in sync so Xcode/Debug builds don't show a stale MARKETING_VERSION
+# (Settings reads CFBundleShortVersionString from the running bundle).
+perl -i -pe "s/(MARKETING_VERSION:\\s*\")[^\"]+(\")/\${1}${VERSION}\${2}/" "$ROOT/project.yml"
+perl -i -pe "s/(CURRENT_PROJECT_VERSION:\\s*\")[^\"]+(\")/\${1}${VERSION}\${2}/" "$ROOT/project.yml"
+
 echo "==> Generating AppIcon.icns"
 mkdir -p "$ICONSET"
 swift "$ROOT/generate_icon.swift" "$ICONSET"
