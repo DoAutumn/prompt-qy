@@ -693,7 +693,7 @@ enum TerminalSender {
     ///
     /// Focusing differs: Terminal.app selects a tab and raises the window by
     /// property; iTerm2 has a `select` verb that walks window → tab → pane;
-    /// Ghostty uses `select tab` + `focus` on a terminal. (iTerm2 also has
+    /// Ghostty focuses by stable app-level `terminal id`. (iTerm2 also has
     /// `write text`, which needs no focus at all — but it replays embedded
     /// newlines as Return presses, so a multi-line prompt would submit itself
     /// line by line. Pasting keeps it intact, because the terminal wraps a
