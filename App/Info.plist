@@ -29,7 +29,7 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Personal tool. Not an Anthropic product.</string>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>控制 Finder 与终端（终端.app / iTerm2 / Otty），以插入文件路径、把内容发送到终端并执行。</string>
+	<string>控制 Finder 与终端（终端.app / iTerm2 / Otty / Ghostty），以插入文件路径、把内容发送到终端并执行。</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>语音识别用于将口述内容实时转写并录入编辑器。</string>
 	<key>NSMicrophoneUsageDescription</key>

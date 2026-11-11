@@ -7,7 +7,7 @@
 //      Control to summon/dismiss.
 //   2. Grab the frontmost app's selection on summon (AX, then synthesized
 //      Cmd+C) + a Send button that pastes+Returns into a chosen Terminal.app,
-//      iTerm2, or Otty tab.
+//      iTerm2, Otty, or Ghostty tab.
 //   3. Drag files onto the editor to insert their paths.
 //   4. Watch the screenshot folder and insert the path of new screenshots.
 //   5. Push-to-talk dictation: hold a key (default right Option) to stream
@@ -419,18 +419,21 @@ enum ExternalEditor {
 
 // MARK: - Terminal sender
 
-/// The terminals we can drive. Both are scripted the same way — focus a tab,
-/// then paste + Return — and only differ in how their windows are addressed.
+/// The terminals we can drive. Terminal.app / iTerm2 / Otty share a
+/// focus-then-⌘V-Return path; Ghostty uses its native `input text` API
+/// (1.3.0+) and only differs in how windows / tabs / splits are addressed.
 enum TerminalApp: String, CaseIterable {
     case terminal
     case iterm
     case otty
+    case ghostty
 
     var bundleId: String {
         switch self {
         case .terminal: return "com.apple.Terminal"
         case .iterm: return "com.googlecode.iterm2"
         case .otty: return "io.appmakes.otty"
+        case .ghostty: return "com.mitchellh.ghostty"
         }
     }
 
@@ -439,6 +442,7 @@ enum TerminalApp: String, CaseIterable {
         case .terminal: return "终端.app"
         case .iterm: return "iTerm2"
         case .otty: return "Otty"
+        case .ghostty: return "Ghostty"
         }
     }
 
@@ -455,8 +459,8 @@ enum TerminalSender {
         let app: TerminalApp
         let windowId: String
         let tabIndex: String
-        /// iTerm2 splits a tab into panes and each is a separate destination.
-        /// Empty for Terminal.app, which has no equivalent.
+        /// iTerm2 / Ghostty splits: session or terminal id. Empty for
+        /// Terminal.app / Otty, which have no equivalent.
         let sessionId: String
         let label: String
     }
@@ -548,6 +552,34 @@ enum TerminalSender {
                                 set rowName to name of s
                             end try
                             set end of outLines to wid & fieldSep & (wi as text) & fieldSep & (ti as text) & fieldSep & (si as text) & fieldSep & (id of s) & fieldSep & geo & fieldSep & rowName
+                        end repeat
+                    end repeat
+            """
+        case .ghostty:
+            // Ghostty (1.3.0+): windows → tabs → terminals (splits). Window
+            // ids are opaque strings; no `bounds` in its scripting suite.
+            body = """
+                    set winName to ""
+                    try
+                        set winName to name of w
+                    end try
+                    set tabList to tabs of w
+                    repeat with ti from 1 to count of tabList
+                        set tabRef to item ti of tabList
+                        set termList to terminals of tabRef
+                        repeat with si from 1 to count of termList
+                            set termRef to item si of termList
+                            set rowName to ""
+                            try
+                                set rowName to name of termRef
+                            end try
+                            if rowName is "" then
+                                try
+                                    set rowName to name of tabRef
+                                end try
+                            end if
+                            if rowName is "" then set rowName to winName
+                            set end of outLines to wid & fieldSep & (wi as text) & fieldSep & (ti as text) & fieldSep & (si as text) & fieldSep & (id of termRef) & fieldSep & geo & fieldSep & rowName
                         end repeat
                     end repeat
             """
@@ -650,16 +682,35 @@ enum TerminalSender {
         return NSEvent.modifierFlags.intersection(watched).isEmpty
     }
 
+    /// Escape a Swift string for embedding inside an AppleScript `"..."` literal.
+    private static func escapeAS(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
     /// Select the target window/tab/pane. Keystrokes are posted separately —
     /// this script only moves focus inside the terminal app.
     ///
     /// Focusing differs: Terminal.app selects a tab and raises the window by
-    /// property; iTerm2 has a `select` verb that walks window → tab → pane.
-    /// (iTerm2 also has `write text`, which needs no focus at all — but it
-    /// replays embedded newlines as Return presses, so a multi-line prompt
-    /// would submit itself line by line. Pasting keeps it intact, because
-    /// the terminal wraps a real ⌘V in bracketed paste.)
+    /// property; iTerm2 has a `select` verb that walks window → tab → pane;
+    /// Ghostty uses `select tab` + `focus` on a terminal. (iTerm2 also has
+    /// `write text`, which needs no focus at all — but it replays embedded
+    /// newlines as Return presses, so a multi-line prompt would submit itself
+    /// line by line. Pasting keeps it intact, because the terminal wraps a
+    /// real ⌘V in bracketed paste.)
     private static func focusTab(_ target: Target) -> Bool {
+        // Ghostty: app-level `terminal id` is stable across tab reorder;
+        // `focus` also raises the window (no window-id / select tab prelude).
+        if target.app == .ghostty {
+            let script = """
+            tell application id "\(target.app.bundleId)"
+                set targetTerm to terminal id "\(escapeAS(target.sessionId))"
+                focus targetTerm
+            end tell
+            """
+            return AppleScriptRunner.succeeds(script)
+        }
+
         let focus: String
         switch target.app {
         case .terminal:
@@ -677,8 +728,10 @@ enum TerminalSender {
             focus = """
             select targetWin
             select tab \(target.tabIndex) of targetWin
-            select session id "\(target.sessionId)" of tab \(target.tabIndex) of targetWin
+            select session id "\(escapeAS(target.sessionId))" of tab \(target.tabIndex) of targetWin
             """
+        case .ghostty:
+            preconditionFailure("Ghostty focus is handled above")
         }
         let script = """
         tell application id "\(target.app.bundleId)"
@@ -721,14 +774,44 @@ enum TerminalSender {
         up?.post(tap: .cghidEventTap)
     }
 
-    /// Put the text on the clipboard, focus the target tab, then paste + Return.
+    /// Deliver `text` to `target`. Ghostty uses its native `input text` +
+    /// `send key "enter"` (no clipboard / HID). Everyone else still goes
+    /// clipboard → focus → ⌘V → Return.
+    ///
     /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
     /// so the caller can keep the text instead of silently dropping it.
     ///
-    /// Caller must already have resigned our own key focus (`orderOut` +
-    /// `NSApp.deactivate`); otherwise the terminal can never become the
-    /// LaunchServices-frontmost app and the paste vanishes into us.
+    /// For the clipboard path, caller must already have resigned our own key
+    /// focus (`orderOut` + `NSApp.deactivate`); otherwise the terminal can
+    /// never become the LaunchServices-frontmost app and the paste vanishes
+    /// into us.
     static func send(_ text: String, to target: Target) -> Bool {
+        if target.app == .ghostty {
+            return sendViaGhostty(text, to: target)
+        }
+        return sendViaClipboardPaste(text, to: target)
+    }
+
+    /// Ghostty 1.3.0+: address the split by stable terminal id and inject
+    /// text directly. `focus` raises its window; no LS-frontmost / HID needed.
+    private static func sendViaGhostty(_ text: String, to target: Target) -> Bool {
+        guard target.app.isRunning else {
+            AppleScriptRunner.lastError = "\(target.app.displayName) 已退出"
+            return false
+        }
+        let script = """
+        tell application id "\(target.app.bundleId)"
+            set targetTerm to terminal id "\(escapeAS(target.sessionId))"
+            focus targetTerm
+            input text "\(escapeAS(text))" to targetTerm
+            send key "enter" to targetTerm
+        end tell
+        """
+        return AppleScriptRunner.succeeds(script)
+    }
+
+    /// Shared path for Terminal.app / iTerm2 / Otty: clipboard + HID paste.
+    private static func sendViaClipboardPaste(_ text: String, to target: Target) -> Bool {
         return ClipboardGate.withPaused {
             let pb = NSPasteboard.general
             pb.clearContents()
@@ -1639,8 +1722,6 @@ final class EditorPanel: NSPanel {
                 alert.messageText = "未找到运行中的 \(scope) 窗口"
                 alert.informativeText =
                     "请先打开一个 \(scope) 窗口（里面跑着 Claude Code），再发送。"
-                    + (Settings.terminalApp == nil ? ""
-                       : "\n\n当前设置只发送到 \(scope)，可在设置中改为「自动」。")
             }
             alert.runModal()
             return

@@ -6,7 +6,7 @@
 
 When you drive Claude Code from the terminal, you constantly feed it file paths, code snippets, error messages and screenshots — copy, switch window, paste, repeat. This little tool collapses those steps into an always-on-top editor you summon with a double-tap.
 
-> ⚠️ Personal tool, not an Anthropic product. Targets **Terminal.app**, **iTerm2**, and **Otty** (pick one or auto in Settings; Otty requires 1.2.0+).
+> ⚠️ Personal tool, not an Anthropic product. Targets **Terminal.app**, **iTerm2**, **Otty**, and **Ghostty** (auto-detects whichever are running; Otty requires 1.2.0+, Ghostty 1.3.0+).
 
 ## Features
 
@@ -21,9 +21,9 @@ When you drive Claude Code from the terminal, you constantly feed it file paths,
 - **Voice dictation**: hold right Option to start recording (real-time streaming recognition), release to stop; a red pulsing dot + "录音中…" indicator appears in the bottom bar. Transcription appears live at the cursor and finalizes on release. Powered by macOS's native SFSpeechRecognizer — no external dependencies
 - **Quick phrases**: preset text snippets in the menu bar; click to insert, or press ⌃1–⌃9. Editable in Settings (one phrase per line)
 - **One-key send**: ⌘↵ → if several terminal windows/tabs exist, pick one by title → text is pasted into Claude and submitted; the editor clears
-- **Terminal.app, iTerm2 & Otty**: send to any (or auto-detect); choose the target in Settings
+- **Terminal.app, iTerm2, Otty & Ghostty**: send to whichever are running (auto-detect)
 - **History** of sent messages in the menu; click to reload into the editor
-- **Customizable**: the three double-tap modifiers, notes vault path / exclude dirs, target terminal, history size, menu label width, and the ⌘⇧4 screenshot save folder (writes the system preference so it survives reboot; menu → Settings…)
+- **Customizable**: the three double-tap modifiers, notes vault path / exclude dirs, history size, menu label width, and the ⌘⇧4 screenshot save folder (writes the system preference so it survives reboot; menu → Settings…)
 
 ## Gestures
 
@@ -100,7 +100,7 @@ Space preview styling follows light/dark appearance; notes search (double-tap Op
 First use will prompt for (grant each once):
 
 - **Accessibility** — global key monitoring (double-tap summon), reading the selection, synthesizing keys
-- **Automation** — controlling Finder, Terminal.app, iTerm2 and/or Otty (enumerating windows/tabs, sending text)
+- **Automation** — controlling Finder, Terminal.app, iTerm2, Otty and/or Ghostty (enumerating windows/tabs, sending text)
 - **Speech Recognition** — macOS native SFSpeechRecognizer for real-time voice transcription
 - **Microphone** — only used while the dictation key is held
 - **Screenshot folder** — watching the system screenshot save directory (Desktop by default; changeable in Settings)
