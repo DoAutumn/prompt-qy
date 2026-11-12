@@ -420,8 +420,9 @@ enum ExternalEditor {
 // MARK: - Terminal sender
 
 /// The terminals we can drive. Terminal.app / iTerm2 / Otty share a
-/// focus-then-⌘V-Return path; Ghostty uses its native `input text` API
-/// (1.3.0+) and only differs in how windows / tabs / splits are addressed.
+/// focus-then-⌘V-Return path; Ghostty uses its native `input text` +
+/// raw-CR submit API (1.3.0+) and only differs in how windows / tabs /
+/// splits are addressed.
 enum TerminalApp: String, CaseIterable {
     case terminal
     case iterm
@@ -775,7 +776,7 @@ enum TerminalSender {
     }
 
     /// Deliver `text` to `target`. Ghostty uses its native `input text` +
-    /// `send key "enter"` (no clipboard / HID). Everyone else still goes
+    /// raw-CR submit (no clipboard / HID). Everyone else still goes
     /// clipboard → focus → ⌘V → Return.
     ///
     /// Returns false (with `AppleScriptRunner.lastError` set) if anything failed,
@@ -792,19 +793,46 @@ enum TerminalSender {
         return sendViaClipboardPaste(text, to: target)
     }
 
+    /// How long to wait after a bracketed paste before synthesizing Return /
+    /// CR. Too short → the prompt bar may accept an empty submit while the
+    /// paste is still in flight, so text lands in the buffer and never sends.
+    /// Cap the byte contribution before multiplying so huge pastes cannot
+    /// overflow `Int` on the way to the 500ms ceiling.
+    private static func pasteSettleMicros(for text: String) -> UInt32 {
+        let capped = min(text.utf8.count, 22_000) // 60_000 + 22_000*20 = 500_000
+        return UInt32(60_000 + capped * 20)
+    }
+
     /// Ghostty 1.3.0+: address the split by stable terminal id and inject
     /// text directly. `focus` raises its window; no LS-frontmost / HID needed.
+    ///
+    /// `input text` is paste-style (bracketed), not keystrokes — it never
+    /// submits by itself. We then inject a raw CR via `perform action
+    /// "text:\r"` (more reliable than `send key "enter"` across prompt-bar
+    /// TUIs). Paste + settle + submit stay in one AppleScript so a failed
+    /// CR does not leave a half-delivered state across two IPC round-trips;
+    /// `perform action`'s boolean is checked (a silent `false` would otherwise
+    /// look like success to `succeeds`).
     private static func sendViaGhostty(_ text: String, to target: Target) -> Bool {
         guard target.app.isRunning else {
             AppleScriptRunner.lastError = "\(target.app.displayName) 已退出"
             return false
         }
+        // AppleScript `delay` is in seconds; keep three decimals so short
+        // settles (≈60ms) are not rounded to zero.
+        let settleSec = String(format: "%.3f",
+                               Double(pasteSettleMicros(for: text)) / 1_000_000.0)
+        // Swift "text:\\\\r" → AppleScript source "text:\\r" → Ghostty action
+        // string text:\r (literal CR). A lone "\r" in AppleScript would be a
+        // real return character and is the wrong action payload.
         let script = """
         tell application id "\(target.app.bundleId)"
             set targetTerm to terminal id "\(escapeAS(target.sessionId))"
             focus targetTerm
             input text "\(escapeAS(text))" to targetTerm
-            send key "enter" to targetTerm
+            delay \(settleSec)
+            set submitted to perform action "text:\\\\r" on targetTerm
+            if submitted is not true then error "Ghostty 未能提交回车"
         end tell
         """
         return AppleScriptRunner.succeeds(script)
@@ -868,8 +896,7 @@ enum TerminalSender {
 
             // Bracketed paste needs a moment before Return, else Claude Code sees
             // an empty submit and the paste arrives after. Scale lightly with size.
-            let pasteSettle = UInt32(min(500_000, 60_000 + text.utf8.count * 20))
-            usleep(pasteSettle)
+            usleep(pasteSettleMicros(for: text))
 
             postKey(0x24, flags: [])
             return true
