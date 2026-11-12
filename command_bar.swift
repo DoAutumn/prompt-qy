@@ -1824,19 +1824,46 @@ struct NoteHit {
     let title: String
     let rank: Int
 
+    /// Best-effort read for preview/search. Edit path must use `loadBodyForEdit`.
     func loadBody() -> String {
         (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    /// Strict UTF-8 read for the in-panel editor — never invent an empty body.
+    func loadBodyForEdit() -> (text: String?, error: String?) {
+        do {
+            return (try String(contentsOf: url, encoding: .utf8), nil)
+        } catch {
+            return (nil, error.localizedDescription)
+        }
     }
 }
 
 /// Scans an Obsidian vault for `.md` and `.sheet` (Spreadsheets plugin) files.
-/// Fine for ~hundreds of notes — no persistent index.
+/// Fine for ~hundreds of notes — no persistent index. Also creates / saves
+/// Markdown notes for the in-panel editor (`.sheet` stays read-only).
 enum MarkdownVault {
     private static let noteExtensions: Set<String> = ["md", "markdown", "sheet"]
+    static let rootPlaceholder = "（库根目录）"
 
-    static func search(query: String) -> [NoteHit] {
-        let root = URL(fileURLWithPath: Settings.notesVaultPath, isDirectory: true)
-        let excludes = Settings.notesExcludeDirs
+    static var rootURL: URL {
+        URL(fileURLWithPath: Settings.notesVaultPath, isDirectory: true)
+    }
+
+    static func isEditableMarkdown(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "md" || ext == "markdown"
+    }
+
+    static func search(
+        query: String,
+        vaultPath: String? = nil,
+        excludes: [String]? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> [NoteHit] {
+        let vault = vaultPath ?? Settings.notesVaultPath
+        let excludes = excludes ?? Settings.notesExcludeDirs
+        let root = URL(fileURLWithPath: vault, isDirectory: true)
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let qLower = q.lowercased()
 
@@ -1845,9 +1872,19 @@ enum MarkdownVault {
         var hits: [NoteHit] = []
         let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            includingPropertiesForKeys: [
+                .isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey
+            ],
             options: [.skipsHiddenFiles])
         while let url = enumerator?.nextObject() as? URL {
+            if isCancelled?() == true { return [] }
+            // Symlinks can resolve outside the vault — skip (match create/write).
+            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+                var isLinkDir: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isLinkDir)
+                if isLinkDir.boolValue { enumerator?.skipDescendants() }
+                continue
+            }
             var isDir: ObjCBool = false
             FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
             if isDir.boolValue {
@@ -1889,6 +1926,7 @@ enum MarkdownVault {
             hits.append(NoteHit(url: url, relativePath: rel, title: title, rank: 1))
         }
 
+        if isCancelled?() == true { return [] }
         return hits.sorted {
             if $0.rank != $1.rank { return $0.rank < $1.rank }
             if $0.title.localizedCaseInsensitiveCompare($1.title) != .orderedSame {
@@ -1900,6 +1938,243 @@ enum MarkdownVault {
         }
     }
 
+    /// Cache key = vault path + excludes; guarded for background ⌘N walks.
+    private static let subdirectoryCacheLock = NSLock()
+    private static var subdirectoryCache: (vaultPath: String, excludes: [String], dirs: [String])?
+
+    static func invalidateSubdirectoryCache() {
+        subdirectoryCacheLock.lock()
+        subdirectoryCache = nil
+        subdirectoryCacheLock.unlock()
+    }
+
+    /// Relative directory paths under the vault (nested), honouring excludes.
+    /// Retries at most twice if Settings move mid-walk (avoids unbounded recursion).
+    static func listSubdirectories() -> [String] {
+        var lastUncached: [String]?
+        for _ in 0..<3 {
+            let vaultPath = Settings.notesVaultPath
+            let excludes = Settings.notesExcludeDirs
+            subdirectoryCacheLock.lock()
+            if let cached = subdirectoryCache,
+               cached.vaultPath == vaultPath,
+               cached.excludes == excludes {
+                let dirs = cached.dirs
+                subdirectoryCacheLock.unlock()
+                return dirs
+            }
+            subdirectoryCacheLock.unlock()
+
+            // Walk the same path we keyed — don't re-read Settings.notesVaultPath mid-walk.
+            let root = URL(fileURLWithPath: vaultPath, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: root.path) else {
+                subdirectoryCacheLock.lock()
+                let stillCurrent = Settings.notesVaultPath == vaultPath
+                    && Settings.notesExcludeDirs == excludes
+                if stillCurrent {
+                    subdirectoryCache = (vaultPath, excludes, [])
+                }
+                subdirectoryCacheLock.unlock()
+                if stillCurrent { return [] }
+                continue
+            }
+
+            var dirs: [String] = []
+            let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles])
+            while let url = enumerator?.nextObject() as? URL {
+                // Symlink dirs can resolve outside the vault — never offer them in ⌘N.
+                if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+                    enumerator?.skipDescendants()
+                    continue
+                }
+                var isDir: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                guard isDir.boolValue else { continue }
+                let rel = relativePath(url, root: root)
+                if shouldExclude(name: url.lastPathComponent, relative: rel, excludes: excludes) {
+                    enumerator?.skipDescendants()
+                    continue
+                }
+                if !rel.isEmpty { dirs.append(rel) }
+            }
+            let sorted = dirs.sorted {
+                $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+            }
+            subdirectoryCacheLock.lock()
+            // Settings moved during the walk — don't publish under the wrong key.
+            guard Settings.notesVaultPath == vaultPath,
+                  Settings.notesExcludeDirs == excludes else {
+                subdirectoryCacheLock.unlock()
+                lastUncached = sorted
+                continue
+            }
+            subdirectoryCache = (vaultPath, excludes, sorted)
+            subdirectoryCacheLock.unlock()
+            return sorted
+        }
+        return lastUncached ?? []
+    }
+
+    /// Normalize a combo / typed subdirectory. Empty = vault root.
+    /// On failure returns `(nil, message)`.
+    static func normalizeRelativeDir(_ raw: String) -> (dir: String?, error: String?) {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s == rootPlaceholder { s = "" }
+        s = s.replacingOccurrences(of: "\\", with: "/")
+        while s.hasPrefix("./") { s = String(s.dropFirst(2)) }
+        s = s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if s.isEmpty { return ("", nil) }
+        if s.hasPrefix("/") || s.contains(":") {
+            return (nil, "子目录须为笔记库内的相对路径")
+        }
+        let parts = s.split(separator: "/").map(String.init)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return (nil, "子目录路径无效（不能包含 ..）")
+        }
+        // Same policy as titles / `.skipsHiddenFiles` search — hidden segments
+        // would create notes that vanish on the next listing.
+        if parts.contains(where: { $0.hasPrefix(".") }) {
+            return (nil, "子目录不能包含以 . 开头的路径组件")
+        }
+        return (parts.joined(separator: "/"), nil)
+    }
+
+    /// Strip path junk from a note title; drop a trailing `.md` / `.markdown`.
+    /// On failure returns `(nil, message)`.
+    static func normalizeTitle(_ raw: String) -> (title: String?, error: String?) {
+        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for ext in [".markdown", ".md"] where t.lowercased().hasSuffix(ext) {
+            t = String(t.dropLast(ext.count))
+            t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if t.isEmpty { return (nil, "请输入标题") }
+        if t.contains("/") || t.contains("\\") || t.contains(":") {
+            return (nil, "标题不能包含路径分隔符")
+        }
+        if t == "." || t == ".." { return (nil, "标题无效") }
+        // Enumerators use `.skipsHiddenFiles` — a leading-dot title would create
+        // a note that appears once via ensureHit, then vanishes from search.
+        if t.hasPrefix(".") { return (nil, "标题不能以 . 开头") }
+        return (t, nil)
+    }
+
+    enum CreateError: Error {
+        case conflict(URL)
+        case message(String)
+    }
+
+    /// Create an empty `.md` under `relativeDir` (created if needed).
+    /// `vaultPath` / `excludes` pin Settings for the whole create (may race).
+    static func createMarkdownNote(
+        title: String,
+        relativeDir: String,
+        vaultPath: String? = nil,
+        excludes: [String]? = nil
+    ) -> Result<NoteHit, CreateError> {
+        let titleNorm = normalizeTitle(title)
+        if let err = titleNorm.error { return .failure(.message(err)) }
+        guard let name = titleNorm.title else { return .failure(.message("请输入标题")) }
+
+        let dirNorm = normalizeRelativeDir(relativeDir)
+        if let err = dirNorm.error { return .failure(.message(err)) }
+        let dir = dirNorm.dir ?? ""
+
+        let vault = vaultPath ?? Settings.notesVaultPath
+        let root = URL(fileURLWithPath: vault, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: root.path) else {
+            return .failure(.message("笔记库路径不存在：\(root.path)"))
+        }
+        let excludes = excludes ?? Settings.notesExcludeDirs
+        let fileRel = dir.isEmpty ? "\(name).md" : "\(dir)/\(name).md"
+        if shouldExclude(name: "\(name).md", relative: fileRel, excludes: excludes)
+            || (!dir.isEmpty && shouldExclude(
+                name: (dir as NSString).lastPathComponent, relative: dir, excludes: excludes)) {
+            return .failure(.message("不能在排除目录中创建笔记（当前排除：\(excludes.joined(separator: "、"))）"))
+        }
+        let folder = dir.isEmpty ? root : root.appendingPathComponent(dir, isDirectory: true)
+        // Containment BEFORE createDirectory — otherwise a symlink parent can
+        // mkdir outside the vault.
+        guard isInsideVault(folder, root: root) else {
+            return .failure(.message("子目录解析后不在笔记库内（请检查符号链接）"))
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: folder, withIntermediateDirectories: true)
+        } catch {
+            return .failure(.message("无法创建目录：\(error.localizedDescription)"))
+        }
+        guard isInsideVault(folder, root: root) else {
+            return .failure(.message("子目录解析后不在笔记库内（请检查符号链接）"))
+        }
+        let url = folder.appendingPathComponent("\(name).md")
+        guard isInsideVault(url, root: root) else {
+            return .failure(.message("目标路径不在笔记库内"))
+        }
+        // Exclusive create — do not replace an existing note (TOCTOU-safe).
+        do {
+            try Data().write(to: url, options: .withoutOverwriting)
+        } catch {
+            if FileManager.default.fileExists(atPath: url.path) {
+                return .failure(.conflict(url))
+            }
+            return .failure(.message("无法创建文件：\(error.localizedDescription)"))
+        }
+        invalidateSubdirectoryCache()
+        let rel = relativePath(url, root: root)
+        return .success(NoteHit(url: url, relativePath: rel, title: name, rank: 0))
+    }
+
+    /// Drop a just-created empty `.md` if the panel hid before opening it.
+    /// `vaultPath` pins the library root when Settings may have moved.
+    static func removeEmptyCreatedNoteIfAbandoned(
+        _ url: URL,
+        vaultPath: String? = nil
+    ) {
+        let root: URL = {
+            if let vaultPath, !vaultPath.isEmpty {
+                return URL(fileURLWithPath: vaultPath, isDirectory: true)
+            }
+            return rootURL
+        }()
+        guard isEditableMarkdown(url), isInsideVault(url, root: root) else { return }
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
+        guard size == 0 else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Atomic UTF-8 write. Returns an error message on failure.
+    /// `vaultPathOverride` keeps a mid-edit session writable if Settings changed
+    /// the vault root underneath the open note.
+    static func write(body: String, to url: URL, vaultPathOverride: String? = nil) -> String? {
+        guard isEditableMarkdown(url) else {
+            return "只能保存 Markdown（.md / .markdown）笔记"
+        }
+        let root: URL = {
+            if let override = vaultPathOverride, !override.isEmpty {
+                return URL(fileURLWithPath: override, isDirectory: true)
+            }
+            return rootURL
+        }()
+        guard isInsideVault(url, root: root) else {
+            return "目标路径不在笔记库内"
+        }
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    static func contentModificationDate(of url: URL) -> Date? {
+        // Prefer FileManager — URL resourceValues can return a stale cached mtime
+        // right after our own write, which made the next ⌘S false-conflict.
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+    }
+
     static func firstMatch(in body: String, matching needle: String) -> String? {
         let n = needle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return nil }
@@ -1908,12 +2183,50 @@ enum MarkdownVault {
         return String(body[range])
     }
 
+    /// True when `url` resolves under `root` after following symlinks.
+    /// For not-yet-created paths, resolves the deepest existing ancestor then
+    /// re-appends the remaining components (so `vault/link/x` → outside fails).
+    private static func isInsideVault(_ url: URL, root: URL) -> Bool {
+        let rootResolved = root.resolvingSymlinksInPath().standardizedFileURL
+        guard let resolved = resolveAgainstExistingAncestors(url) else { return false }
+        return path(resolved.path, isUnder: rootResolved.path)
+    }
+
+    private static func path(_ full: String, isUnder prefix: String) -> Bool {
+        if full == prefix { return true }
+        let boundary = prefix.hasSuffix("/") ? prefix : prefix + "/"
+        return full.hasPrefix(boundary)
+    }
+
+    private static func resolveAgainstExistingAncestors(_ url: URL) -> URL? {
+        let fm = FileManager.default
+        var probe = url.standardizedFileURL
+        var missing: [String] = []
+        while !fm.fileExists(atPath: probe.path) {
+            let name = probe.lastPathComponent
+            guard !name.isEmpty, name != "/", name != ".", name != ".." else { return nil }
+            missing.insert(name, at: 0)
+            let parent = probe.deletingLastPathComponent()
+            if parent.path == probe.path { return nil }
+            probe = parent
+        }
+        var resolved = probe.resolvingSymlinksInPath().standardizedFileURL
+        for name in missing {
+            resolved.appendPathComponent(name)
+            if fm.fileExists(atPath: resolved.path) {
+                resolved = resolved.resolvingSymlinksInPath().standardizedFileURL
+            }
+        }
+        return resolved
+    }
+
     private static func relativePath(_ url: URL, root: URL) -> String {
         let full = url.standardizedFileURL.path
         let prefix = root.standardizedFileURL.path
-        if full.hasPrefix(prefix) {
-            let drop = prefix.count + (prefix.hasSuffix("/") ? 0 : 1)
-            return String(full.dropFirst(drop))
+        if full == prefix { return "" }
+        let boundary = prefix.hasSuffix("/") ? prefix : prefix + "/"
+        if full.hasPrefix(boundary) {
+            return String(full.dropFirst(boundary.count))
         }
         return url.lastPathComponent
     }
@@ -2053,6 +2366,234 @@ private final class NotesSearchIconView: NSImageView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+private enum NotesAlertAccessoryAssoc {
+    static var titleDelegate: UInt8 = 0
+    static var dirDelegate: UInt8 = 0
+}
+
+/// Soft search-bar style row for the new-note alert — same language as the
+/// notes panel header: no bezel, no focus ring, just text on a quiet fill.
+private final class NotesAlertFieldRow: NSView {
+    let textField = NSTextField(string: "")
+    private var menuButton: NotesAlertDirMenuButton?
+    private let fieldPadX: CGFloat = 10
+    private let menuW: CGFloat = 22
+
+    init(frame frameRect: NSRect, showsDirMenu: Bool) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.cornerRadius = 8
+        if #available(macOS 11.0, *) {
+            layer?.cornerCurve = .continuous
+        }
+        updateFill(focused: false)
+
+        textField.isBordered = false
+        textField.isBezeled = false
+        textField.focusRingType = .none
+        textField.drawsBackground = false
+        textField.backgroundColor = .clear
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.font = .systemFont(ofSize: 13, weight: .regular)
+        textField.lineBreakMode = .byClipping
+        textField.cell?.isScrollable = true
+        (textField.cell as? NSTextFieldCell)?.usesSingleLineMode = true
+        textField.translatesAutoresizingMaskIntoConstraints = true
+        addSubview(textField)
+
+        if showsDirMenu {
+            let menu = NotesAlertDirMenuButton(
+                frame: NSRect(x: 0, y: 0, width: menuW, height: 18))
+            menu.dirField = textField
+            menuButton = menu
+            addSubview(menu)
+        }
+
+        layoutFields()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var acceptsFirstResponder: Bool { false }
+
+    override func layout() {
+        super.layout()
+        layoutFields()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateFill(focused: textField.currentEditor() != nil)
+    }
+
+    func configureDirMenu(dirs: [String], rootTitle: String) {
+        menuButton?.configure(dirs: dirs, rootTitle: rootTitle)
+    }
+
+    func markFocused(_ focused: Bool) {
+        updateFill(focused: focused)
+        if focused {
+            (textField.currentEditor() as? NSTextView)?.focusRingType = .none
+            (textField.currentEditor() as? NSTextView)?.drawsBackground = false
+        }
+    }
+
+    private func layoutFields() {
+        let h = bounds.height
+        let menu = menuButton
+        let textW = menu == nil
+            ? bounds.width - fieldPadX * 2
+            : bounds.width - fieldPadX * 2 - menuW - 4
+        textField.frame = NSRect(
+            x: fieldPadX,
+            y: (h - 18) / 2,
+            width: max(40, textW),
+            height: 18)
+        if let menu {
+            menu.frame = NSRect(
+                x: bounds.width - fieldPadX - menuW,
+                y: (h - 18) / 2,
+                width: menuW,
+                height: 18)
+        }
+    }
+
+    private func updateFill(focused: Bool) {
+        // Quiet fill like a search well — never a stroked box.
+        let base = NSColor.black.withAlphaComponent(focused ? 0.07 : 0.045)
+        let adapted = NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            if dark {
+                return NSColor.white.withAlphaComponent(focused ? 0.14 : 0.08)
+            }
+            return base
+        }
+        layer?.backgroundColor = adapted.cgColor
+        layer?.borderWidth = 0
+    }
+}
+
+/// Tracks focus so the soft row can nudge its fill — no system outline.
+private final class NotesAlertRowFieldDelegate: NSObject, NSTextFieldDelegate {
+    weak var row: NotesAlertFieldRow?
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        row?.markFocused(true)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        row?.markFocused(false)
+    }
+}
+
+/// Chevron-only pull-down that fills a sibling dir field. No own chrome.
+private final class NotesAlertDirMenuButton: NSPopUpButton {
+    weak var dirField: NSTextField?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect, pullsDown: true)
+        finishSetup()
+    }
+
+    override init(frame buttonFrame: NSRect, pullsDown flag: Bool) {
+        super.init(frame: buttonFrame, pullsDown: true)
+        finishSetup()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func finishSetup() {
+        autoenablesItems = false
+        focusRingType = .none
+        isBordered = false
+        if let cell = cell as? NSPopUpButtonCell {
+            cell.arrowPosition = .noArrow
+            cell.imagePosition = .imageOnly
+            cell.focusRingType = .none
+            cell.backgroundColor = .clear
+        }
+        target = self
+        action = #selector(menuPicked(_:))
+    }
+
+    override var focusRingType: NSFocusRingType {
+        get { .none }
+        set {}
+    }
+
+    override func drawFocusRingMask() {}
+
+    func configure(dirs: [String], rootTitle: String) {
+        removeAllItems()
+        addItem(withTitle: "")
+        if let img = NSImage(
+            systemSymbolName: "chevron.down",
+            accessibilityDescription: "选择子目录")
+        {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+            let configured = img.withSymbolConfiguration(cfg)
+            item(at: 0)?.image = configured
+            item(at: 0)?.image?.isTemplate = true
+        }
+        addItem(withTitle: rootTitle)
+        item(at: 1)?.representedObject = rootTitle
+        for dir in dirs {
+            addItem(withTitle: dir)
+            lastItem?.representedObject = dir
+        }
+        selectItem(at: 0)
+    }
+
+    @objc private func menuPicked(_ sender: NSPopUpButton) {
+        defer { selectItem(at: 0) }
+        let idx = indexOfSelectedItem
+        guard idx > 0 else { return }
+        let value = (item(at: idx)?.representedObject as? String) ?? item(at: idx)?.title
+        guard let value, !value.isEmpty else { return }
+        dirField?.stringValue = value
+    }
+}
+
+/// Soft amber unsaved marker shown beside a note title in the list.
+private final class NotesDirtyDotView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 3
+        updateColor()
+        toolTip = "未保存"
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 6, height: 6) }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColor()
+    }
+
+    private func updateColor() {
+        // Warm amber that stays readable on both selection fills and plain rows.
+        layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.92).cgColor
+    }
+}
+
+/// Notes-panel source editor: Esc asks the panel to confirm/close
+/// (but not while 拼音 / IME marked text is composing).
+private final class NotesEditorTextView: NSTextView {
+    var onCancel: (() -> Void)?
+    override func cancelOperation(_ sender: Any?) {
+        if hasMarkedText() {
+            inputContext?.discardMarkedText()
+            return
+        }
+        onCancel?()
+    }
+}
+
 /// Opaque rounded chrome. Vibrancy + WKWebView fights corner clipping and
 /// washes out body text — solid fill keeps both readable and clean.
 private final class NotesPanelChrome: NSView {
@@ -2080,17 +2621,25 @@ private final class NotesPanelChrome: NSView {
 }
 
 /// Always-on-top notes browser: query → list → Markdown preview (select/copy),
-/// jumping to the first body match when present. Chrome mirrors Spotlight:
-/// borderless floating panel, custom search row, light status strip.
-final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate {
+/// plus in-panel Markdown edit / create (⌘E / ⌘S / ⌘N). `.sheet` stays
+/// preview-only. Chrome mirrors Spotlight: borderless floating panel, custom
+/// search row, light status strip.
+final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSSplitViewDelegate, NSTextViewDelegate {
     /// Keep WebKit around briefly after hide so rapid re-open stays snappy.
     private static let webViewTeardownDelay: TimeInterval = 15
+
+    private enum PaneMode {
+        case preview
+        case edit
+    }
 
     private let searchField = NotesSearchField()
     private let tableView = NSTableView()
     /// Created on first show; torn down after the panel stays hidden.
     private var previewWeb: WKWebView?
     private var previewPane: NSView!
+    private var editorScroll: NSScrollView?
+    private var editorView: NSTextView?
     private var webViewTeardownWork: DispatchWorkItem?
     private let statusLabel = NSTextField(labelWithString: "")
     private let placeholderLabel = NSTextField(labelWithString: "搜索文件名或正文…")
@@ -2102,6 +2651,11 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     private var pendingJump: (token: Int, text: String?)?
     private var loadToken = 0
     private var currentQuery = ""
+    /// Vault / excludes that produced the current `hits` list.
+    private var resultsVaultPath = ""
+    private var resultsExcludes: [String] = []
+    /// Settings changed while editing / ⌘N — refresh after leaving that session.
+    private var settingsChangedDuringEdit = false
     private var didApplyInitialSplit = false
     private var splitInitRetries = 0
     /// Per-note match hint folded into the bottom status line.
@@ -2109,6 +2663,63 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     /// Last previewed note + query — skip redundant WKWebView reloads.
     private var previewedPath: String?
     private var previewedQuery: String?
+    private var paneMode: PaneMode = .preview
+    private var editingURL: URL?
+    /// Vault root captured when edit began — survives Settings vault changes.
+    private var editingVaultPath: String?
+    private var loadedEditText = ""
+    /// mtime at successful load/save — cheap precheck before content compare on ⌘S.
+    private var loadedEditMTime: Date?
+    /// False until a successful `loadBodyForEdit` lands — blocks save/wipe.
+    private var editContentReady = false
+    /// Set on first edit after load; avoids full-string compares on every keystroke.
+    private var editHasEdits = false
+    private var editLoadToken = 0
+    /// Prevents stacked ⌘N alerts while the directory walk / create is in flight.
+    private var isPresentingNewNote = false
+    /// Bumped on hide and each ⌘N start — drops stale dir-walk / create callbacks.
+    private var newNotePresentationToken = 0
+    /// Bumped to cancel a post-create search→enterEdit that lost the race.
+    private var newNoteCompletionToken = 0
+    /// Coalesces deferred dirty→select so rapid clicks do not stack alerts.
+    private var pendingDirtySelectRow: Int?
+    private var isDirty: Bool {
+        paneMode == .edit && editContentReady && editHasEdits
+    }
+
+    private enum SaveOutcome {
+        case saved
+        case reloaded
+        case cancelled
+        case failed
+    }
+
+    /// App quit / external close: prompt if the in-panel editor is dirty.
+    @discardableResult
+    func confirmDiscardOrSaveIfNeeded() -> Bool {
+        resolveDirtyIfNeeded()
+    }
+
+    /// Settings vault/excludes changed — refresh listing when not mid-edit.
+    func handleSettingsChanged() {
+        MarkdownVault.invalidateSubdirectoryCache()
+        if paneMode == .edit || isPresentingNewNote {
+            settingsChangedDuringEdit = true
+            return
+        }
+        guard isVisible else { return }
+        runSearch(currentQuery)
+    }
+
+    private func listNeedsRefreshAgainstSettings() -> Bool {
+        settingsChangedDuringEdit
+            || resultsVaultPath != Settings.notesVaultPath
+            || resultsExcludes != Settings.notesExcludeDirs
+    }
+
+    private static func sameNoteURL(_ a: URL, _ b: URL) -> Bool {
+        a.standardizedFileURL.path == b.standardizedFileURL.path
+    }
 
     init() {
         super.init(
@@ -2132,12 +2743,33 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     }
 
     override var canBecomeKey: Bool { true }
-    override func cancelOperation(_ sender: Any?) { orderOut(nil) }
-    override func close() { orderOut(nil) }
+    override func cancelOperation(_ sender: Any?) { requestClose() }
+    override func close() { requestClose() }
 
-    override func orderOut(_ sender: Any?) {
+    /// Esc / ⌘W / red light: confirm unsaved edits, then hide.
+    private func requestClose() {
+        guard resolveDirtyIfNeeded() else { return }
+        leaveEditMode(showPreviewAfter: false)
+        hidePanel()
+    }
+
+    private func hidePanel() {
         // End editing so NotesSearchField.isEditing / lastSize reset; otherwise
         // a later `stringValue = ""` is ignored while isEditing stays true.
+        if searchField.currentEditor() != nil {
+            endEditing(for: searchField)
+        }
+        makeFirstResponder(nil)
+        releasePreviewResources()
+        super.orderOut(nil)
+    }
+
+    override func orderOut(_ sender: Any?) {
+        // External callers (and hidePanel) land here; if still dirty, confirm.
+        if isVisible, isDirty {
+            guard resolveDirtyIfNeeded() else { return }
+            leaveEditMode(showPreviewAfter: false)
+        }
         if searchField.currentEditor() != nil {
             endEditing(for: searchField)
         }
@@ -2155,6 +2787,25 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         pendingJump = nil
         previewedPath = nil
         previewedQuery = nil
+        paneMode = .preview
+        editingURL = nil
+        editingVaultPath = nil
+        loadedEditText = ""
+        loadedEditMTime = nil
+        editContentReady = false
+        editHasEdits = false
+        editLoadToken += 1
+        newNotePresentationToken += 1
+        newNoteCompletionToken += 1
+        isPresentingNewNote = false
+        pendingDirtySelectRow = nil
+        resultsVaultPath = ""
+        resultsExcludes = []
+        settingsChangedDuringEdit = false
+        editorView?.string = ""
+        editorScroll?.isHidden = true
+        previewWeb?.isHidden = false
+        setSearchFieldInteractionEnabled(true)
         hits = []
         tableView.reloadData()
         matchHint = ""
@@ -2222,14 +2873,27 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         cancelWebViewTeardown()
         ensurePreviewWeb()
         if !isVisible { center() }
+        makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Already editing: re-summon must not clear the query / tear down the
+        // session (in-flight runSearch("") used to wipe unsaved work).
+        if paneMode == .edit {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.paneMode == .edit, let editor = self.editorView else { return }
+                self.makeFirstResponder(editor)
+            }
+            return
+        }
+
+        // Fresh open: drop a stale subdirectory cache so ⌘N sees new folders.
+        MarkdownVault.invalidateSubdirectoryCache()
         searchField.stringValue = ""
         runSearch("")
         // Finish chrome layout before focusing so the first IME keystroke
         // does not collide with an initial Auto Layout pass.
         contentView?.layoutSubtreeIfNeeded()
         applyInitialSplitIfNeeded()
-        makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         // Defer first-responder + input-context activation to the next turn;
         // synchronous focus on cold launch often eats the first 拼音 letter.
         DispatchQueue.main.async { [weak self] in
@@ -2295,6 +2959,11 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         dragArea.onActivate = { [weak self] in
             guard let self else { return }
             self.makeKeyAndOrderFront(nil)
+            // Editing owns focus — don't yank it to the frozen search field.
+            if self.paneMode == .edit, let editor = self.editorView {
+                self.makeFirstResponder(editor)
+                return
+            }
             self.makeFirstResponder(self.searchField)
         }
 
@@ -2367,6 +3036,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.setContentHuggingPriority(.required, for: .vertical)
+        statusLabel.lineBreakMode = .byTruncatingMiddle
 
         let headerSep = NSBox()
         headerSep.boxType = .separator
@@ -2434,14 +3104,64 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
             statusLabel.stringValue = emptyMessage
             return
         }
+        if paneMode == .edit {
+            var parts: [String]
+            if !editContentReady {
+                parts = ["加载中…"]
+            } else {
+                parts = [isDirty ? "未保存" : "编辑中"]
+                parts.append("⌘S 保存")
+            }
+            parts.append("⌘E 预览")
+            parts.append("⌘N 新建")
+            parts.append("Esc 关闭")
+            statusLabel.stringValue = parts.joined(separator: " · ")
+            return
+        }
         guard !hits.isEmpty else {
-            statusLabel.stringValue = ""
+            statusLabel.stringValue = "⌘N 新建 · Esc 关闭"
             return
         }
         var parts = ["\(hits.count) 条"]
         if !matchHint.isEmpty { parts.append(matchHint) }
+        if selectedHit.map({ MarkdownVault.isEditableMarkdown($0.url) }) == true {
+            parts.append("⌘E 编辑")
+        }
+        parts.append("⌘N 新建")
         parts.append("Esc 关闭")
         statusLabel.stringValue = parts.joined(separator: " · ")
+    }
+
+    private var selectedHit: NoteHit? {
+        let row = tableView.selectedRow
+        guard row >= 0, row < hits.count else { return nil }
+        return hits[row]
+    }
+
+    /// Refresh the unsaved dot on the row currently being edited.
+    private func reloadDirtyIndicatorInList() {
+        guard let editingURL,
+              let row = hits.firstIndex(where: { Self.sameNoteURL($0.url, editingURL) })
+        else { return }
+        tableView.reloadData(
+            forRowIndexes: IndexSet(integer: row),
+            columnIndexes: IndexSet(integer: 0))
+    }
+
+    /// Editing owns the right pane — keep the query field frozen so it cannot
+    /// diverge from `currentQuery` / the result list.
+    private func setSearchFieldInteractionEnabled(_ enabled: Bool) {
+        searchField.isEditable = enabled
+        searchField.isSelectable = enabled
+        if !enabled {
+            if searchField.currentEditor() != nil {
+                endEditing(for: searchField)
+            }
+            if searchField.stringValue != currentQuery {
+                searchField.stringValue = currentQuery
+                updateSearchPlaceholder()
+            }
+        }
     }
 
     // MARK: NSSplitViewDelegate
@@ -2467,6 +3187,9 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
     func controlTextDidChange(_ obj: Notification) {
         guard obj.object as AnyObject === searchField else { return }
         updateSearchPlaceholder()
+        // Editing owns the right pane — searching would eject the session.
+        // Leave edit (⌘E) before typing a new query.
+        guard paneMode != .edit else { return }
         // Width refresh is already handled in NotesSearchField.textDidChange.
         let q = searchField.stringValue
         searchWork?.cancel()
@@ -2495,38 +3218,112 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
             moveSelection(by: 1); return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            orderOut(nil); return true
+            requestClose(); return true
         }
         return false
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags == .command,
+              let chars = event.charactersIgnoringModifiers?.lowercased(),
+              chars.count == 1 else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch chars {
+        case "e":
+            toggleEditMode(); return true
+        case "s":
+            if paneMode == .edit { _ = saveCurrentEdit(); return true }
+        case "n":
+            presentNewNoteDialog(); return true
+        default:
+            break
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     private func runSearch(_ query: String) {
         searchGeneration += 1
         let gen = searchGeneration
+        let previousQuery = currentQuery
+        let searchingWhileEditing = paneMode == .edit
         currentQuery = query
+        // Sample vault + excludes together so list content matches resultsExcludes.
         let vault = Settings.notesVaultPath
+        let excludes = Settings.notesExcludeDirs
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let results = MarkdownVault.search(query: query)
+            let results = MarkdownVault.search(
+                query: query, vaultPath: vault, excludes: excludes,
+                isCancelled: { [weak self] in
+                    guard let self else { return true }
+                    return gen != self.searchGeneration
+                })
             DispatchQueue.main.async {
                 guard let self = self, gen == self.searchGeneration else { return }
-                self.hits = results
-                self.tableView.reloadData()
-                self.previewedPath = nil  // force preview refresh for new results
-                if results.isEmpty {
-                    self.clearPreview()
-                    let exists = FileManager.default.fileExists(atPath: vault)
-                    self.refreshStatusLine(emptyMessage: exists
-                        ? "无匹配结果"
-                        : "笔记库路径不存在：\(vault)")
-                } else {
-                    self.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-                    // selectRowIndexes is a no-op when row 0 was already selected,
-                    // so selectionDidChange may not fire — always show once here.
-                    self.showPreview(for: 0)
-                    self.refreshStatusLine()
+                // A search that started in preview must not land on an edit
+                // session begun while it was in flight (`enterEditMode` bumps
+                // searchGeneration; this is the belt-and-suspenders check).
+                if self.paneMode == .edit, !searchingWhileEditing {
+                    return
                 }
+                if self.paneMode == .edit {
+                    guard self.resolveDirtyIfNeeded() else {
+                        self.currentQuery = previousQuery
+                        if self.searchField.currentEditor() != nil {
+                            self.endEditing(for: self.searchField)
+                        }
+                        self.searchField.stringValue = previousQuery
+                        self.updateSearchPlaceholder()
+                        return
+                    }
+                    self.leaveEditMode(showPreviewAfter: false)
+                }
+                self.applySearchResults(
+                    results, vaultPath: vault, excludes: excludes)
             }
         }
+    }
+
+    private func applySearchResults(
+        _ results: [NoteHit],
+        vaultPath: String,
+        excludes: [String],
+        selectURL: URL? = nil,
+        ensureHit: NoteHit? = nil
+    ) {
+        var results = results
+        if let ensureHit,
+           !results.contains(where: { Self.sameNoteURL($0.url, ensureHit.url) }) {
+            results.insert(ensureHit, at: 0)
+        }
+        hits = results
+        resultsVaultPath = vaultPath
+        resultsExcludes = excludes
+        settingsChangedDuringEdit = false
+        tableView.reloadData()
+        previewedPath = nil  // force preview refresh for new results
+        if results.isEmpty {
+            clearPreview()
+            let exists = FileManager.default.fileExists(atPath: vaultPath)
+            refreshStatusLine(emptyMessage: exists
+                ? "无匹配结果 · ⌘N 新建 · Esc 关闭"
+                : "笔记库路径不存在：\(vaultPath)")
+            return
+        }
+        let index: Int = {
+            if let selectURL,
+               let i = results.firstIndex(where: { Self.sameNoteURL($0.url, selectURL) }) {
+                return i
+            }
+            return 0
+        }()
+        tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        tableView.scrollRowToVisible(index)
+        // selectRowIndexes is a no-op when the row was already selected,
+        // so selectionDidChange may not fire — always show once here.
+        showPreview(for: index)
+        refreshStatusLine()
     }
 
     private func moveSelection(by delta: Int) {
@@ -2541,6 +3338,665 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
 
     @objc private func tableClicked() {
         // Selection change drives preview; nothing else needed.
+    }
+
+    // MARK: Edit / create
+
+    /// Save / Don't Save / Cancel. Returns false if the user cancelled.
+    @discardableResult
+    private func resolveDirtyIfNeeded() -> Bool {
+        guard isDirty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "笔记有未保存的更改"
+        alert.informativeText = "要在离开前保存吗？"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "不保存")
+        alert.addButton(withTitle: "取消")
+        alert.alertStyle = .warning
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            // Reloaded from disk also clears local dirty — allow navigation to proceed.
+            switch saveCurrentEdit() {
+            case .saved, .reloaded: return true
+            case .cancelled, .failed: return false
+            }
+        case .alertSecondButtonReturn:
+            if let editorView {
+                resetEditorBuffer(editorView, text: loadedEditText)
+            }
+            editHasEdits = false
+            reloadDirtyIndicatorInList()
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Replace editor text and drop undo history so ⌘Z cannot leak across notes.
+    private func resetEditorBuffer(_ editor: NSTextView, text: String) {
+        editor.breakUndoCoalescing()
+        editor.undoManager?.removeAllActions()
+        editor.string = text
+        editor.breakUndoCoalescing()
+        editor.undoManager?.removeAllActions()
+    }
+
+    private func toggleEditMode() {
+        if paneMode == .edit {
+            guard resolveDirtyIfNeeded() else { return }
+            leaveEditMode(showPreviewAfter: true)
+            return
+        }
+        // ⌘N directory walk / create I/O owns the session — don't re-enter edit.
+        if isPresentingNewNote {
+            NSSound.beep()
+            return
+        }
+        guard let hit = selectedHit else {
+            NSSound.beep()
+            return
+        }
+        guard MarkdownVault.isEditableMarkdown(hit.url) else {
+            NSSound.beep()
+            return
+        }
+        enterEditMode(for: hit)
+    }
+
+    private func enterEditMode(for hit: NoteHit) {
+        // Post-create open is allowed after finishNewNotePresentation; block only
+        // while the ⌘N alert / create I/O still holds the flag.
+        if isPresentingNewNote { return }
+        // Drop in-flight search/preview so they cannot tear down this session.
+        searchGeneration += 1
+        loadToken += 1
+        editLoadToken += 1
+        newNoteCompletionToken += 1
+        let token = editLoadToken
+        let url = hit.url
+
+        let editor = ensureEditor()
+        // Locked until UTF-8 load commits — avoids typing that would be wiped
+        // and then discarded without a dirty prompt.
+        editor.isEditable = false
+        editor.isSelectable = false
+        resetEditorBuffer(editor, text: "")
+        loadedEditText = ""
+        loadedEditMTime = nil
+        editContentReady = false
+        editHasEdits = false
+        editingURL = url
+        // Prefer the vault that produced this hit list (survives Settings races).
+        editingVaultPath = resultsVaultPath.isEmpty
+            ? Settings.notesVaultPath : resultsVaultPath
+        paneMode = .edit
+        setSearchFieldInteractionEnabled(false)
+        previewWeb?.isHidden = true
+        editorScroll?.isHidden = false
+        previewedPath = nil
+        refreshStatusLine()
+        reloadDirtyIndicatorInList()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let loaded = hit.loadBodyForEdit()
+            let mtime = MarkdownVault.contentModificationDate(of: url)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard token == self.editLoadToken,
+                      self.paneMode == .edit,
+                      self.editingURL.map({ Self.sameNoteURL($0, url) }) == true else { return }
+                if let err = loaded.error, loaded.text == nil {
+                    self.leaveEditMode(showPreviewAfter: true)
+                    let alert = NSAlert()
+                    alert.messageText = "无法打开笔记"
+                    alert.informativeText =
+                        "未能以 UTF-8 读取文件，已取消编辑以免覆盖原文。\n\n\(err)"
+                    alert.runModal()
+                    return
+                }
+                let body = loaded.text ?? ""
+                self.resetEditorBuffer(editor, text: body)
+                editor.isEditable = true
+                editor.isSelectable = true
+                self.loadedEditText = body
+                self.loadedEditMTime = mtime
+                self.editContentReady = true
+                self.editHasEdits = false
+                self.makeFirstResponder(editor)
+                self.refreshStatusLine()
+            }
+        }
+    }
+
+    private func leaveEditMode(showPreviewAfter: Bool) {
+        let row = tableView.selectedRow
+        editLoadToken += 1
+        pendingDirtySelectRow = nil
+        paneMode = .preview
+        editingURL = nil
+        editingVaultPath = nil
+        loadedEditText = ""
+        loadedEditMTime = nil
+        editContentReady = false
+        editHasEdits = false
+        if let editorView {
+            editorView.isEditable = false
+            editorView.isSelectable = false
+            resetEditorBuffer(editorView, text: "")
+        }
+        editorScroll?.isHidden = true
+        previewWeb?.isHidden = false
+        setSearchFieldInteractionEnabled(true)
+        refreshStatusLine()
+        tableView.reloadData()
+        if isVisible {
+            makeFirstResponder(searchField)
+        }
+        // Vault/excludes may have changed under an edit session — drop stale hits
+        // before the user can re-⌘E an old-path note against the new root.
+        if isVisible, listNeedsRefreshAgainstSettings() {
+            settingsChangedDuringEdit = false
+            runSearch(currentQuery)
+            return
+        }
+        if showPreviewAfter, row >= 0 {
+            previewedPath = nil
+            showPreview(for: row)
+        }
+    }
+
+    /// True when on-disk text differs from the last loaded/saved buffer.
+    /// mtime is a cheap precheck; content compare strips UTF-8 BOM (String load does).
+    private func diskDivergedFromLoadedEdit(url: URL) -> Bool {
+        if let known = loadedEditMTime,
+           let current = MarkdownVault.contentModificationDate(of: url),
+           current == known {
+            return false
+        }
+        guard let diskData = try? Data(contentsOf: url) else {
+            // Unreadable disk → treat as diverged so we don't silently overwrite.
+            return true
+        }
+        let payload: Data = diskData.starts(with: [0xEF, 0xBB, 0xBF])
+            ? Data(diskData.dropFirst(3))
+            : diskData
+        guard let diskText = String(data: payload, encoding: .utf8) else { return true }
+        return diskText != loadedEditText
+    }
+
+    /// Prompt when the on-disk note changed under us. `.overwrite` proceeds to write.
+    private func promptExternalEditConflict() -> SaveOutcome? {
+        let alert = NSAlert()
+        alert.messageText = "文件已被其他程序修改"
+        alert.informativeText = "磁盘上的内容与打开时不一致。要覆盖、重新加载，还是取消？"
+        alert.addButton(withTitle: "覆盖")
+        alert.addButton(withTitle: "重新加载")
+        alert.addButton(withTitle: "取消")
+        alert.alertStyle = .warning
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return nil  // overwrite — caller writes
+        case .alertSecondButtonReturn:
+            reloadCurrentEditFromDisk()
+            return .reloaded
+        default:
+            return .cancelled
+        }
+    }
+
+    @discardableResult
+    private func saveCurrentEdit() -> SaveOutcome {
+        guard paneMode == .edit, let url = editingURL, let editorView else {
+            return .failed
+        }
+        guard editContentReady else {
+            let alert = NSAlert()
+            alert.messageText = "无法保存"
+            alert.informativeText = "笔记仍在加载或未能读入，请稍候再试或取消编辑。"
+            alert.runModal()
+            return .failed
+        }
+        let text = editorView.string
+        // Editor matches our baseline — still check disk before adopting mtime.
+        // Refreshing mtime alone (without content check) let an external writer's
+        // mtime poison the baseline and skip conflict UI on the next real save.
+        if text == loadedEditText {
+            if !diskDivergedFromLoadedEdit(url: url) {
+                editHasEdits = false
+                loadedEditMTime = MarkdownVault.contentModificationDate(of: url)
+                refreshStatusLine()
+                reloadDirtyIndicatorInList()
+                return .saved
+            }
+            if let outcome = promptExternalEditConflict() {
+                return outcome
+            }
+            // Overwrite with unchanged editor text — fall through to write.
+            if diskDivergedFromLoadedEdit(url: url),
+               let outcome = promptExternalEditConflict() {
+                return outcome
+            }
+        } else if diskDivergedFromLoadedEdit(url: url) {
+            // Only prompt when disk content actually differs from our baseline.
+            if let outcome = promptExternalEditConflict() {
+                return outcome
+            }
+            // Overwrite chosen — verify once more after the modal (TOCTOU).
+            if diskDivergedFromLoadedEdit(url: url),
+               let outcome = promptExternalEditConflict() {
+                return outcome
+            }
+        }
+        if let err = MarkdownVault.write(
+            body: text, to: url, vaultPathOverride: editingVaultPath)
+        {
+            let alert = NSAlert()
+            alert.messageText = "保存失败"
+            alert.informativeText = err
+            alert.runModal()
+            return .failed
+        }
+        // Prefer the bytes that actually landed (handles any write normalization).
+        if let onDisk = try? String(contentsOf: url, encoding: .utf8) {
+            loadedEditText = onDisk
+            if editorView.string != onDisk {
+                let ranges = editorView.selectedRanges
+                resetEditorBuffer(editorView, text: onDisk)
+                editorView.selectedRanges = ranges
+            }
+        } else {
+            loadedEditText = text
+        }
+        loadedEditMTime = MarkdownVault.contentModificationDate(of: url)
+        editHasEdits = false
+        previewedPath = nil
+        refreshStatusLine()
+        reloadDirtyIndicatorInList()
+        return .saved
+    }
+
+    /// Replace the editor buffer with the on-disk UTF-8 body (external conflict).
+    private func reloadCurrentEditFromDisk() {
+        guard paneMode == .edit, let url = editingURL, let editorView else { return }
+        let loaded = NoteHit(
+            url: url,
+            relativePath: url.lastPathComponent,
+            title: url.deletingPathExtension().lastPathComponent,
+            rank: 0
+        ).loadBodyForEdit()
+        if let err = loaded.error, loaded.text == nil {
+            let alert = NSAlert()
+            alert.messageText = "无法重新加载"
+            alert.informativeText = err
+            alert.runModal()
+            return
+        }
+        let body = loaded.text ?? ""
+        resetEditorBuffer(editorView, text: body)
+        loadedEditText = body
+        loadedEditMTime = MarkdownVault.contentModificationDate(of: url)
+        editHasEdits = false
+        refreshStatusLine()
+        reloadDirtyIndicatorInList()
+    }
+
+    private func ensureEditor() -> NSTextView {
+        if let editorView { return editorView }
+        let scroll = NSScrollView(frame: previewPane.bounds)
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.autohidesScrollers = true
+
+        let tv = NotesEditorTextView()
+        tv.delegate = self
+        tv.onCancel = { [weak self] in self?.requestClose() }
+        tv.isRichText = false
+        tv.allowsUndo = true
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        tv.textContainerInset = NSSize(width: 10, height: 10)
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude)
+        tv.isHorizontallyResizable = false
+        tv.isVerticallyResizable = true
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(
+            width: scroll.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude)
+        tv.backgroundColor = .textBackgroundColor
+        tv.drawsBackground = true
+
+        scroll.documentView = tv
+        previewPane.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: previewPane.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: previewPane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: previewPane.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: previewPane.bottomAnchor),
+        ])
+        editorScroll = scroll
+        editorView = tv
+        return tv
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard paneMode == .edit,
+              notification.object as AnyObject === editorView else { return }
+        if editContentReady {
+            let current = editorView?.string ?? ""
+            if !editHasEdits {
+                if current != loadedEditText {
+                    editHasEdits = true
+                    reloadDirtyIndicatorInList()
+                }
+            } else {
+                // Already dirty — skip full compare unless length matches (undo→clean).
+                if current.utf8.count == loadedEditText.utf8.count,
+                   current == loadedEditText {
+                    editHasEdits = false
+                    reloadDirtyIndicatorInList()
+                }
+            }
+        }
+        refreshStatusLine()
+    }
+
+    /// Clears the ⌘N-in-flight flag. When `refreshIfNeeded`, consumes a deferred
+    /// Settings change (Cancel / abandoned create) so the listing does not stay stale.
+    private func finishNewNotePresentation(token: Int, refreshIfNeeded: Bool = true) {
+        guard token == newNotePresentationToken else { return }
+        isPresentingNewNote = false
+        guard refreshIfNeeded,
+              isVisible,
+              paneMode != .edit,
+              listNeedsRefreshAgainstSettings() else { return }
+        settingsChangedDuringEdit = false
+        runSearch(currentQuery)
+    }
+
+    /// If Settings moved under a create I/O, re-list with live vault/excludes.
+    private func refreshListingAfterDeferredSettingsChange() {
+        guard isVisible, paneMode != .edit, listNeedsRefreshAgainstSettings() else { return }
+        settingsChangedDuringEdit = false
+        runSearch(currentQuery)
+    }
+
+    private func presentNewNoteDialog(
+        prefillTitle: String = "",
+        prefillDir: String = "",
+        conflictMessage: String? = nil
+    ) {
+        if isPresentingNewNote { return }
+        if isDirty {
+            guard resolveDirtyIfNeeded() else { return }
+            leaveEditMode(showPreviewAfter: true)
+        } else if paneMode == .edit {
+            leaveEditMode(showPreviewAfter: true)
+        }
+
+        isPresentingNewNote = true
+        newNotePresentationToken += 1
+        let token = newNotePresentationToken
+        // Directory walk off the main thread (cached after the first pass).
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let dirs = MarkdownVault.listSubdirectories()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard token == self.newNotePresentationToken, self.isVisible else {
+                    self.finishNewNotePresentation(token: token)
+                    return
+                }
+                self.showNewNoteAlert(
+                    dirs: dirs,
+                    prefillTitle: prefillTitle,
+                    prefillDir: prefillDir,
+                    conflictMessage: conflictMessage,
+                    token: token)
+            }
+        }
+    }
+
+    private func showNewNoteAlert(
+        dirs: [String],
+        prefillTitle: String,
+        prefillDir: String,
+        conflictMessage: String?,
+        token: Int
+    ) {
+        guard token == newNotePresentationToken, isVisible else {
+            finishNewNotePresentation(token: token)
+            return
+        }
+        // Dir walk was async — user may have re-entered edit; clear again.
+        if paneMode == .edit {
+            guard resolveDirtyIfNeeded() else {
+                finishNewNotePresentation(token: token)
+                return
+            }
+            leaveEditMode(showPreviewAfter: true)
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "新建笔记"
+        alert.informativeText = conflictMessage
+            ?? "创建 Markdown 文件（.md）。子目录可手填相对路径，不存在时会自动创建。"
+        alert.addButton(withTitle: "创建")
+        alert.addButton(withTitle: "取消")
+        // Esc → 取消 (second button).
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+
+        // Soft search-bar rows (same idea as the notes panel header field).
+        let width: CGFloat = 300
+        let fieldH: CGFloat = 32
+        let fieldGap: CGFloat = 8
+        let accessoryH = fieldH + fieldGap + fieldH
+
+        let titleRow = NotesAlertFieldRow(
+            frame: NSRect(x: 0, y: fieldH + fieldGap, width: width, height: fieldH),
+            showsDirMenu: false)
+        titleRow.textField.placeholderString = "标题"
+        titleRow.textField.stringValue = prefillTitle
+        let titleDelegate = NotesAlertRowFieldDelegate()
+        titleDelegate.row = titleRow
+        titleRow.textField.delegate = titleDelegate
+
+        let dirRow = NotesAlertFieldRow(
+            frame: NSRect(x: 0, y: 0, width: width, height: fieldH),
+            showsDirMenu: true)
+        dirRow.textField.placeholderString = "子目录（可手填相对路径）"
+        let initialDir = prefillDir.isEmpty ? MarkdownVault.rootPlaceholder : prefillDir
+        dirRow.textField.stringValue = initialDir
+        dirRow.configureDirMenu(dirs: dirs, rootTitle: MarkdownVault.rootPlaceholder)
+        let dirDelegate = NotesAlertRowFieldDelegate()
+        dirDelegate.row = dirRow
+        dirRow.textField.delegate = dirDelegate
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: width, height: accessoryH))
+        accessory.addSubview(titleRow)
+        accessory.addSubview(dirRow)
+        // Keep delegates alive for the modal lifetime.
+        objc_setAssociatedObject(
+            accessory, &NotesAlertAccessoryAssoc.titleDelegate,
+            titleDelegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        objc_setAssociatedObject(
+            accessory, &NotesAlertAccessoryAssoc.dirDelegate,
+            dirDelegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        alert.accessoryView = accessory
+        alert.window.initialFirstResponder = titleRow.textField
+
+        let response = alert.runModal()
+        guard token == newNotePresentationToken else { return }
+        guard response == .alertFirstButtonReturn else {
+            finishNewNotePresentation(token: token)
+            return
+        }
+
+        let title = titleRow.textField.stringValue
+        let dirRaw = dirRow.textField.stringValue
+        // Pin vault + excludes for create→open so mid-flight Settings changes
+        // cannot attach the new file to a mismatched library snapshot.
+        let createVault = Settings.notesVaultPath
+        let createExcludes = Settings.notesExcludeDirs
+        // Disk I/O off the main thread; keep isPresentingNewNote until done.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = MarkdownVault.createMarkdownNote(
+                title: title,
+                relativeDir: dirRaw,
+                vaultPath: createVault,
+                excludes: createExcludes)
+            DispatchQueue.main.async {
+                guard let self else {
+                    if case .success(let hit) = result {
+                        MarkdownVault.removeEmptyCreatedNoteIfAbandoned(
+                            hit.url, vaultPath: createVault)
+                    }
+                    return
+                }
+                switch result {
+                case .success(let hit):
+                    guard token == self.newNotePresentationToken, self.isVisible else {
+                        MarkdownVault.removeEmptyCreatedNoteIfAbandoned(
+                            hit.url, vaultPath: createVault)
+                        self.finishNewNotePresentation(token: token)
+                        return
+                    }
+                    // Success opens the editor next — skip cancel-path refresh here.
+                    self.finishNewNotePresentation(token: token, refreshIfNeeded: false)
+                    self.beginEditingCreatedNote(
+                        hit, vaultPath: createVault, excludes: createExcludes)
+                case .failure(.conflict(_)):
+                    guard token == self.newNotePresentationToken, self.isVisible else {
+                        self.finishNewNotePresentation(token: token)
+                        return
+                    }
+                    self.showNewNoteAlert(
+                        dirs: dirs,
+                        prefillTitle: title,
+                        prefillDir: dirRaw == MarkdownVault.rootPlaceholder ? "" : dirRaw,
+                        conflictMessage: "已存在同名笔记，请更换标题后再创建。",
+                        token: token)
+                case .failure(.message(let msg)):
+                    guard token == self.newNotePresentationToken, self.isVisible else {
+                        self.finishNewNotePresentation(token: token)
+                        return
+                    }
+                    let err = NSAlert()
+                    err.messageText = "无法创建笔记"
+                    err.informativeText = msg
+                    err.runModal()
+                    guard token == self.newNotePresentationToken, self.isVisible else {
+                        self.finishNewNotePresentation(token: token)
+                        return
+                    }
+                    self.showNewNoteAlert(
+                        dirs: dirs,
+                        prefillTitle: title,
+                        prefillDir: dirRaw == MarkdownVault.rootPlaceholder ? "" : dirRaw,
+                        conflictMessage: nil,
+                        token: token)
+                }
+            }
+        }
+    }
+
+    /// After exclusive create: refresh the empty query list and open the editor.
+    private func beginEditingCreatedNote(
+        _ hit: NoteHit,
+        vaultPath: String,
+        excludes: [String]
+    ) {
+        // Clear query only after results land — avoids empty-query + stale list
+        // if the user Cancels a late dirty prompt.
+        searchGeneration += 1
+        let gen = searchGeneration
+        newNoteCompletionToken += 1
+        let createToken = newNoteCompletionToken
+        // Prefer live Settings when they moved during create I/O (excludes-only).
+        let listVault = Settings.notesVaultPath
+        let listExcludes = Settings.notesExcludeDirs
+        let searchVault: String
+        let searchExcludes: [String]
+        if listVault == vaultPath {
+            searchVault = listVault
+            searchExcludes = listExcludes
+        } else {
+            searchVault = vaultPath
+            searchExcludes = excludes
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let results = MarkdownVault.search(
+                query: "", vaultPath: searchVault, excludes: searchExcludes,
+                isCancelled: { [weak self] in
+                    guard let self else { return true }
+                    return gen != self.searchGeneration
+                        || createToken != self.newNoteCompletionToken
+                })
+            DispatchQueue.main.async {
+                guard let self else {
+                    MarkdownVault.removeEmptyCreatedNoteIfAbandoned(
+                        hit.url, vaultPath: vaultPath)
+                    return
+                }
+                guard gen == self.searchGeneration,
+                      createToken == self.newNoteCompletionToken,
+                      self.isVisible else {
+                    // Hidden before open → drop the empty file. Token/gen mismatch
+                    // while still visible means another session took over; keep it.
+                    if !self.isVisible {
+                        MarkdownVault.removeEmptyCreatedNoteIfAbandoned(
+                            hit.url, vaultPath: vaultPath)
+                    }
+                    return
+                }
+                // Library root moved during create I/O — drop the empty orphan in
+                // the old vault, then refresh the new listing (no ensureHit).
+                if Settings.notesVaultPath != vaultPath {
+                    MarkdownVault.removeEmptyCreatedNoteIfAbandoned(
+                        hit.url, vaultPath: vaultPath)
+                    self.settingsChangedDuringEdit = false
+                    self.runSearch(self.currentQuery)
+                    return
+                }
+                // Cancel = stay on current edit; keep the newly created file on disk.
+                guard self.resolveDirtyIfNeeded() else {
+                    self.refreshListingAfterDeferredSettingsChange()
+                    return
+                }
+                if self.paneMode == .edit {
+                    self.leaveEditMode(showPreviewAfter: false)
+                }
+                if self.searchField.currentEditor() != nil {
+                    self.endEditing(for: self.searchField)
+                }
+                self.searchField.stringValue = ""
+                self.currentQuery = ""
+                self.updateSearchPlaceholder()
+                // Live excludes if Settings moved; vault is still the create root.
+                let applyExcludes = Settings.notesExcludeDirs
+                let applyResults: [NoteHit]
+                if applyExcludes == searchExcludes {
+                    applyResults = results
+                } else {
+                    // Excludes changed again while search was in flight — one sync
+                    // pass is enough for the empty-query listing (no body reads).
+                    applyResults = MarkdownVault.search(
+                        query: "", vaultPath: vaultPath, excludes: applyExcludes)
+                }
+                self.applySearchResults(
+                    applyResults,
+                    vaultPath: vaultPath,
+                    excludes: applyExcludes,
+                    selectURL: hit.url,
+                    ensureHit: hit)
+                self.enterEditMode(for: hit)
+            }
+        }
     }
 
     private func clearPreview() {
@@ -2645,23 +4101,38 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
                 title.tag = 1
                 title.font = .systemFont(ofSize: 13, weight: .medium)
                 title.lineBreakMode = .byTruncatingTail
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 title.translatesAutoresizingMaskIntoConstraints = false
+                let dirty = NotesDirtyDotView()
+                dirty.identifier = NSUserInterfaceItemIdentifier("NotesDirtyDot")
+                dirty.isHidden = true
+                dirty.setContentHuggingPriority(.required, for: .horizontal)
+                dirty.setContentCompressionResistancePriority(.required, for: .horizontal)
+                dirty.translatesAutoresizingMaskIntoConstraints = false
+                let titleRow = NSStackView(views: [title, dirty])
+                titleRow.identifier = NSUserInterfaceItemIdentifier("NotesTitleRow")
+                titleRow.orientation = .horizontal
+                titleRow.alignment = .centerY
+                titleRow.spacing = 6
+                titleRow.translatesAutoresizingMaskIntoConstraints = false
                 let sub = NSTextField(labelWithString: "")
-                sub.tag = 2
+                sub.identifier = NSUserInterfaceItemIdentifier("NotesSubdir")
                 sub.font = .systemFont(ofSize: 11)
                 sub.textColor = .secondaryLabelColor
                 sub.lineBreakMode = .byTruncatingMiddle
                 sub.translatesAutoresizingMaskIntoConstraints = false
-                c.addSubview(title)
+                c.addSubview(titleRow)
                 c.addSubview(sub)
                 c.textField = title
                 NSLayoutConstraint.activate([
-                    title.topAnchor.constraint(equalTo: c.topAnchor, constant: 8),
-                    title.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 12),
-                    title.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -12),
-                    sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 3),
-                    sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-                    sub.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+                    dirty.widthAnchor.constraint(equalToConstant: 6),
+                    dirty.heightAnchor.constraint(equalToConstant: 6),
+                    titleRow.topAnchor.constraint(equalTo: c.topAnchor, constant: 8),
+                    titleRow.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 12),
+                    titleRow.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -12),
+                    sub.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 3),
+                    sub.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
+                    sub.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
                     sub.bottomAnchor.constraint(equalTo: c.bottomAnchor, constant: -8),
                 ])
                 return c
@@ -2671,14 +4142,76 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         // Same basename may exist as both .md and .sheet — show extension for sheets.
         cell.textField?.stringValue = ext == "sheet" ? "\(hit.title).sheet" : hit.title
         let dir = (hit.relativePath as NSString).deletingLastPathComponent
-        (cell.viewWithTag(2) as? NSTextField)?.stringValue = dir.isEmpty ? "（库根目录）" : dir
+        let subLabel = cell.subviews
+            .compactMap { $0 as? NSTextField }
+            .first { $0.identifier?.rawValue == "NotesSubdir" }
+            ?? (cell.subviews.last as? NSTextField)
+        subLabel?.stringValue = dir.isEmpty ? "（库根目录）" : dir
+        let showDirty = isDirty
+            && editingURL.map({ Self.sameNoteURL($0, hit.url) }) == true
+        let dirtyDot = (cell.subviews
+            .compactMap { $0 as? NSStackView }
+            .first { $0.identifier?.rawValue == "NotesTitleRow" })?
+            .arrangedSubviews
+            .compactMap { $0 as? NotesDirtyDotView }
+            .first
+        dirtyDot?.isHidden = !showDirty
         cell.toolTip = hit.relativePath
         return cell
     }
 
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        guard paneMode == .edit else { return true }
+        if row >= 0, row < hits.count,
+           let editingURL,
+           Self.sameNoteURL(hits[row].url, editingURL) {
+            return true
+        }
+        // Never runModal inside AppKit's selection machinery — defer the dirty
+        // prompt and intentional select to the next main-queue turn.
+        if isDirty {
+            let alreadyQueued = pendingDirtySelectRow != nil
+            pendingDirtySelectRow = row
+            if !alreadyQueued {
+                DispatchQueue.main.async { [weak self] in
+                    self?.flushPendingDirtySelect()
+                }
+            }
+            return false
+        }
+        return true
+    }
+
+    /// Deferred from `shouldSelectRow` so Save / Don't Save / Cancel is not nested
+    /// in the table's selection run loop.
+    private func flushPendingDirtySelect() {
+        let row = pendingDirtySelectRow
+        pendingDirtySelectRow = nil
+        guard let row, isVisible, paneMode == .edit else { return }
+        guard row >= 0, row < hits.count else { return }
+        if let editingURL, Self.sameNoteURL(hits[row].url, editingURL) { return }
+        guard resolveDirtyIfNeeded() else { return }
+        tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        tableView.scrollRowToVisible(row)
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         let row = tableView.selectedRow
-        if row >= 0 { showPreview(for: row) }
+        guard row >= 0, row < hits.count else { return }
+        let hit = hits[row]
+        if paneMode == .edit {
+            if MarkdownVault.isEditableMarkdown(hit.url) {
+                let same = editingURL.map { Self.sameNoteURL(hit.url, $0) } ?? false
+                if !same {
+                    enterEditMode(for: hit)
+                }
+            } else {
+                leaveEditMode(showPreviewAfter: true)
+            }
+        } else {
+            showPreview(for: row)
+            refreshStatusLine()
+        }
     }
 }
 
@@ -2713,6 +4246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ClipboardMonitor.shared.restart()
         // Path may have changed via the screenshot-location picker.
         self?.screenshotWatcher.start()
+        // Vault / excludes may have changed — refresh notes panel when idle.
+        self?.notesPanel?.handleSettingsChanged()
     }
 
     private func notesSearchPanel() -> NotesSearchPanel {
@@ -2743,6 +4278,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         ensureAccessibilityPermission()
         ensureSpeechPermission()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Notes panel may hold unsaved edits that Esc/orderOut would prompt for.
+        if let panel = notesPanel, !panel.confirmDiscardOrSaveIfNeeded() {
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {

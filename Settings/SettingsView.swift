@@ -148,7 +148,8 @@ private struct NotesSettingsTab: View {
         }
         .formStyle(.grouped)
         .padding(12)
-        .onChange(of: model.excludesText) { _ in model.commitExcludes() }
+        .onChange(of: model.excludesText) { _ in model.scheduleCommitExcludes() }
+        .onDisappear { model.flushCommitExcludes() }
     }
 }
 
@@ -183,6 +184,8 @@ final class SettingsFormModel: ObservableObject {
     @Published var vaultFullPath: String
 
     private var suppressCommit = false
+    /// Coalesces per-keystroke excludes edits so vault rescans are not O(n keys).
+    private var excludesCommitWork: DispatchWorkItem?
 
     var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
@@ -201,6 +204,9 @@ final class SettingsFormModel: ObservableObject {
     }
 
     func reload() {
+        // Commit pending excludes before resetting UI — otherwise reopening
+        // Settings (show → reload) silently drops in-progress edits.
+        flushCommitExcludes()
         suppressCommit = true
         clipboardTextLimit = Settings.clipboardTextLimit
         clipboardImageLimit = Settings.clipboardImageLimit
@@ -229,12 +235,33 @@ final class SettingsFormModel: ObservableObject {
         Settings.quickPhrases = lines
     }
 
+    func scheduleCommitExcludes() {
+        guard !suppressCommit else { return }
+        excludesCommitWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.excludesCommitWork = nil
+            self?.commitExcludes()
+        }
+        excludesCommitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    func flushCommitExcludes() {
+        guard excludesCommitWork != nil else { return }
+        excludesCommitWork?.cancel()
+        excludesCommitWork = nil
+        commitExcludes()
+    }
+
     func commitExcludes() {
         guard !suppressCommit else { return }
         let lines = excludesText.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        // Skip no-op writes so debounce flush / identical text do not rescan.
+        guard lines != Settings.notesExcludeDirs else { return }
         Settings.notesExcludeDirs = lines
+        onChange()
     }
 
     func chooseScreenshotPath() {
