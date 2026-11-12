@@ -2585,6 +2585,27 @@ private final class NotesDirtyDotView: NSView {
 /// (but not while 拼音 / IME marked text is composing).
 private final class NotesEditorTextView: NSTextView {
     var onCancel: (() -> Void)?
+
+    /// Explicit TextKit 1 stack — default TextKit 2 on macOS 13+ has caret /
+    /// focus regressions inside floating panels (no insertion point, no typing).
+    override convenience init(frame frameRect: NSRect) {
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(
+            width: max(frameRect.width, 1),
+            height: CGFloat.greatestFiniteMagnitude))
+        container.widthTracksTextView = true
+        layout.addTextContainer(container)
+        self.init(frame: frameRect, textContainer: container)
+    }
+
+    override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
+        super.init(frame: frameRect, textContainer: container)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
     override func cancelOperation(_ sender: Any?) {
         if hasMarkedText() {
             inputContext?.discardMarkedText()
@@ -2879,10 +2900,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         // Already editing: re-summon must not clear the query / tear down the
         // session (in-flight runSearch("") used to wipe unsaved work).
         if paneMode == .edit {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.paneMode == .edit, let editor = self.editorView else { return }
-                self.makeFirstResponder(editor)
-            }
+            focusNotesEditor()
             return
         }
 
@@ -2960,8 +2978,8 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
             guard let self else { return }
             self.makeKeyAndOrderFront(nil)
             // Editing owns focus — don't yank it to the frozen search field.
-            if self.paneMode == .edit, let editor = self.editorView {
-                self.makeFirstResponder(editor)
+            if self.paneMode == .edit {
+                self.focusNotesEditor()
                 return
             }
             self.makeFirstResponder(self.searchField)
@@ -3416,10 +3434,10 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         let url = hit.url
 
         let editor = ensureEditor()
-        // Locked until UTF-8 load commits — avoids typing that would be wiped
-        // and then discarded without a dirty prompt.
+        // Keep selectable so the view can accept first responder; only lock
+        // editing until UTF-8 load commits (avoids wiped keystrokes + no dirty).
         editor.isEditable = false
-        editor.isSelectable = false
+        editor.isSelectable = true
         resetEditorBuffer(editor, text: "")
         loadedEditText = ""
         loadedEditMTime = nil
@@ -3433,6 +3451,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         setSearchFieldInteractionEnabled(false)
         previewWeb?.isHidden = true
         editorScroll?.isHidden = false
+        layoutNotesEditorGeometry()
         previewedPath = nil
         refreshStatusLine()
         reloadDirtyIndicatorInList()
@@ -3462,9 +3481,60 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
                 self.loadedEditMTime = mtime
                 self.editContentReady = true
                 self.editHasEdits = false
-                self.makeFirstResponder(editor)
                 self.refreshStatusLine()
+                self.focusNotesEditor()
             }
+        }
+    }
+
+    /// Size the text container to the clip view so empty/short notes still fill
+    /// the pane (otherwise clicks miss the document view on macOS 14).
+    private func layoutNotesEditorGeometry() {
+        guard let scroll = editorScroll, let editor = editorView else { return }
+        scroll.layoutSubtreeIfNeeded()
+        let clip = scroll.contentView.bounds.size
+        let width = max(clip.width, 1)
+        let height = max(clip.height, 1)
+        editor.minSize = NSSize(width: 0, height: height)
+        editor.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude)
+        editor.textContainer?.containerSize = NSSize(
+            width: width, height: CGFloat.greatestFiniteMagnitude)
+        if editor.frame.width != width {
+            editor.setFrameSize(NSSize(
+                width: width, height: max(editor.frame.height, height)))
+        }
+    }
+
+    /// Focus the notes editor after layout / key-window settle. Synchronous
+    /// `makeFirstResponder` right after unhiding often fails on macOS 14.x
+    /// (no caret, keystrokes go nowhere).
+    private func focusNotesEditor() {
+        guard paneMode == .edit, editContentReady, editorView != nil else { return }
+        if !isKeyWindow {
+            makeKeyAndOrderFront(nil)
+        }
+        layoutNotesEditorGeometry()
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.paneMode == .edit,
+                  self.editContentReady,
+                  let editor = self.editorView else { return }
+            if !self.isKeyWindow {
+                self.makeKeyAndOrderFront(nil)
+            }
+            editor.isEditable = true
+            editor.isSelectable = true
+            _ = self.makeFirstResponder(editor)
+            let length = (editor.string as NSString).length
+            let sel = editor.selectedRange()
+            if sel.location > length || sel.location + sel.length > length {
+                editor.setSelectedRange(NSRange(location: 0, length: 0))
+            }
+            editor.inputContext?.activate()
+            NSTextInputContext.current?.activate()
+            editor.updateInsertionPointStateAndRestartTimer(true)
         }
     }
 
@@ -3481,7 +3551,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         editHasEdits = false
         if let editorView {
             editorView.isEditable = false
-            editorView.isSelectable = false
+            editorView.isSelectable = true
             resetEditorBuffer(editorView, text: "")
         }
         editorScroll?.isHidden = true
@@ -3649,7 +3719,13 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         scroll.drawsBackground = false
         scroll.autohidesScrollers = true
 
-        let tv = NotesEditorTextView()
+        let initial = scroll.contentSize.width > 0
+            ? scroll.contentSize
+            : previewPane.bounds.size
+        let tv = NotesEditorTextView(frame: NSRect(
+            x: 0, y: 0,
+            width: max(initial.width, 1),
+            height: max(initial.height, 1)))
         tv.delegate = self
         tv.onCancel = { [weak self] in self?.requestClose() }
         tv.isRichText = false
@@ -3659,16 +3735,12 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         tv.isAutomaticTextReplacementEnabled = false
         tv.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         tv.textContainerInset = NSSize(width: 10, height: 10)
-        tv.minSize = NSSize(width: 0, height: 0)
+        tv.minSize = NSSize(width: 0, height: max(initial.height, 1))
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                             height: CGFloat.greatestFiniteMagnitude)
         tv.isHorizontallyResizable = false
         tv.isVerticallyResizable = true
         tv.autoresizingMask = [.width]
-        tv.textContainer?.widthTracksTextView = true
-        tv.textContainer?.containerSize = NSSize(
-            width: scroll.contentSize.width,
-            height: CGFloat.greatestFiniteMagnitude)
         tv.backgroundColor = .textBackgroundColor
         tv.drawsBackground = true
 
@@ -3682,6 +3754,7 @@ final class NotesSearchPanel: NSPanel, NSTextFieldDelegate, NSTableViewDataSourc
         ])
         editorScroll = scroll
         editorView = tv
+        layoutNotesEditorGeometry()
         return tv
     }
 
